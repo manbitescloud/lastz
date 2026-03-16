@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Last Z: Capital Mud-Fill (Advanced)</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #121212; color: #e0e0e0; padding: 20px; }
+        .container { max-width: 1100px; margin: auto; display: grid; grid-template-columns: 350px 1fr; gap: 20px; }
+        .panel { background: #1e1e1e; padding: 20px; border-radius: 8px; border: 1px solid #333; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+        input { width: 70px; padding: 8px; margin: 5px; background: #2d2d2d; color: #fff; border: 1px solid #444; border-radius: 4px; }
+        input[type="text"] { width: 140px; }
+        .alliance-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; border-bottom: 1px solid #333; padding-bottom: 5px; }
+        button { background: #28a745; color: white; border: none; padding: 12px; cursor: pointer; width: 100%; border-radius: 4px; font-weight: bold; font-size: 1em; margin-top: 10px; }
+        button:hover { background: #218838; }
+        table { width: 100%; border-collapse: collapse; margin-top: 15px; background: #1e1e1e; }
+        th, td { border: 1px solid #333; padding: 10px; text-align: left; font-size: 0.9em; }
+        th { background: #2d2d2d; color: #aaa; }
+        canvas { background: #000; border: 2px solid #444; border-radius: 8px; margin-top: 20px; width: 100%; cursor: crosshair; }
+        .legend { font-size: 0.8em; color: #888; margin-bottom: 10px; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <div class="panel">
+        <h3>Alliance Deployment</h3>
+        <p class="legend">Total HQs needed for full saturation: ~80-95</p>
+        <div id="inputs"></div>
+        <button onclick="runOptimization()">Generate Optimal Placement</button>
+    </div>
+
+    <div class="panel">
+        <h3>Placement Map & Coordinates</h3>
+        <canvas id="mapCanvas" width="600" height="600"></canvas>
+        <div id="results" style="max-height: 300px; overflow-y: auto; margin-top: 20px;">
+            <table>
+                <thead><tr><th>Alliance</th><th>HQ</th><th>X,Y</th></tr></thead>
+                <tbody id="tableBody"></tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<script>
+// EXTERNAL MUD BOUNDARY
+const outerMud = [
+    {x: 482, y: 465}, {x: 517, y: 465}, {x: 535, y: 500},
+    {x: 517, y: 535}, {x: 482, y: 535}, {x: 465, y: 500}
+];
+
+// INTERNAL FORBIDDEN ZONE (The Capital Building + Protrusions)
+// Modeled from your line segments to create the "Hole"
+const innerForbidden = [
+    {x: 494, y: 483}, {x: 508, y: 483}, {x: 515, y: 496},
+    {x: 516, y: 502}, {x: 508, y: 517}, {x: 494, y: 517},
+    {x: 490, y: 514}, {x: 483, y: 500}, {x: 490, y: 486}
+];
+
+function isInside(x, y, poly) {
+    let inside = false;
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+        let xi = poly[i].x, yi = poly[i].y;
+        let xj = poly[j].x, yj = poly[j].y;
+        let intersect = ((yi > y) != (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
+        if (intersect) inside = !inside;
+    }
+    return inside;
+}
+
+function init() {
+    const div = document.getElementById('inputs');
+    for(let i=1; i<=10; i++) {
+        div.innerHTML += `
+            <div class="alliance-row">
+                <input type="text" id="n${i}" placeholder="Alliance ${i}">
+                <input type="number" id="c${i}" value="0" min="0">
+            </div>`;
+    }
+}
+
+function runOptimization() {
+    const tableBody = document.getElementById('tableBody');
+    tableBody.innerHTML = "";
+    const hqSize = 2; // Footprint of HQ
+    const gap = 1;    // 1 tile gap prevents 2x2 teleport
+    const step = hqSize + gap;
+    
+    let validSpots = [];
+    // Scan the coordinate space
+    for (let y = 465; y <= 535; y += step) {
+        for (let x = 465; x <= 535; x += step) {
+            // Must be inside MUD and NOT inside the inner Forbidden zone
+            if (isInside(x, y, outerMud) && !isInside(x, y, innerForbidden)) {
+                validSpots.push({x, y});
+            }
+        }
+    }
+
+    let spotIdx = 0;
+    let mapData = [];
+    for (let i = 1; i <= 10; i++) {
+        const name = document.getElementById(`n${i}`).value || `ALN ${i}`;
+        const count = parseInt(document.getElementById(`c${i}`).value);
+        const color = `hsl(${(i * 35) % 360}, 70%, 60%)`;
+
+        for (let j = 0; j < count; j++) {
+            if (spotIdx < validSpots.length) {
+                const s = validSpots[spotIdx];
+                tableBody.innerHTML += `<tr><td>${name}</td><td>#${j+1}</td><td><b>${s.x}, ${s.y}</b></td></tr>`;
+                mapData.push({ ...s, color });
+                spotIdx++;
+            }
+        }
+    }
+    draw(mapData);
+}
+
+function draw(data) {
+    const canvas = document.getElementById('mapCanvas');
+    const ctx = canvas.getContext('2d');
+    const scale = 7;
+    const off = 460;
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // Draw Outer Mud
+    ctx.beginPath();
+    ctx.strokeStyle = "#444";
+    outerMud.forEach((p, i) => {
+        let px = (p.x - off) * scale;
+        let py = (p.y - off) * scale;
+        if(i===0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    });
+    ctx.closePath();
+    ctx.stroke();
+
+    // Draw Inner Forbidden Zone (The Hole)
+    ctx.fillStyle = "#331111";
+    ctx.beginPath();
+    innerForbidden.forEach((p, i) => {
+        let px = (p.x - off) * scale;
+        let py = (p.y - off) * scale;
+        if(i===0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    });
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+
+    // Draw HQs
+    data.forEach(p => {
+        ctx.fillStyle = p.color;
+        ctx.fillRect((p.x - off) * scale, (p.y - off) * scale, 2 * scale, 2 * scale);
+        ctx.strokeStyle = "white";
+        ctx.lineWidth = 0.5;
+        ctx.strokeRect((p.x - off) * scale, (p.y - off) * scale, 2 * scale, 2 * scale);
+    });
+}
+
+init();
+</script>
+</body>
+</html>

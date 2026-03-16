@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>HQ Optimizer - Locked Coordinates</title>
+    <style>
+        body { background: #0b0b0b; color: #eee; font-family: sans-serif; margin: 0; overflow: hidden; }
+        #viewport { width: 100vw; height: 100vh; display: flex; align-items: center; justify-content: center; cursor: none; }
+        .ui { position: absolute; top: 20px; left: 20px; background: rgba(0,0,0,0.8); padding: 15px; border-radius: 8px; border: 1px solid #444; pointer-events: none; z-index: 10; }
+        
+        /* The Actual Game Map Area */
+        #map-canvas { background: #1a1a1a; box-shadow: 0 0 20px rgba(0,0,0,0.5); }
+    </style>
+</head>
+<body>
+
+<div class="ui">
+    <strong>Teleport:</strong> <span id="coords">X: 0, Y: 0</span><br>
+    <span id="status" style="font-weight:bold; color:red;">OUT OF BOUNDS</span>
+</div>
+
+<div id="viewport">
+    <svg id="map-canvas" width="600" height="600" viewBox="460 460 80 80" xmlns="http://www.w3.org/2000/svg">
+        
+        <polygon id="white-field" points="482,465 517,465 535,500 517,535 482,535 465,500" 
+                 fill="white" stroke="#ccc" stroke-width="0.5" />
+
+        <circle cx="482" cy="508" r="3" fill="red" opacity="0.7" /> <circle cx="482" cy="480" r="3" fill="red" opacity="0.7" /> <circle cx="525" cy="500" r="3" fill="red" opacity="0.7" /> <g id="placed-hqs"></g>
+
+        <polygon id="ghost" points="0,-4 3.5,-2 3.5,2 0,4 -3.5,2 -3.5,-2" 
+                 fill="rgba(0, 255, 204, 0.5)" stroke="#00ffcc" stroke-width="0.5" />
+    </svg>
+</div>
+
+<script>
+    const svg = document.getElementById('map-canvas');
+    const ghost = document.getElementById('ghost');
+    const field = document.getElementById('white-field');
+    const statusTxt = document.getElementById('status');
+    const coordsTxt = document.getElementById('coords');
+
+    const boundaryPoints = [{x:482,y:465},{x:517,y:465},{x:535,y:500},{x:517,y:535},{x:482,y:535},{x:465,y:500}];
+    const badZones = [{x:482,y:508},{x:482,y:480},{x:525,y:500}];
+
+    function isInside(x, y) {
+        let inside = false;
+        for (let i = 0, j = boundaryPoints.length - 1; i < boundaryPoints.length; j = i++) {
+            let xi = boundaryPoints[i].x, yi = boundaryPoints[i].y;
+            let xj = boundaryPoints[j].x, yj = boundaryPoints[j].y;
+            let intersect = ((yi > y) != (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
+            if (intersect) inside = !inside;
+        }
+        return inside;
+    }
+
+    function isBlocked(x, y) {
+        return badZones.some(z => Math.sqrt((x-z.x)**2 + (y-z.y)**2) < 4);
+    }
+
+    svg.addEventListener('mousemove', (e) => {
+        const CTM = svg.getScreenCTM();
+        const pt = svg.createSVGPoint();
+        pt.x = e.clientX; pt.y = e.clientY;
+        const p = pt.matrixTransform(CTM.inverse());
+        
+        const x = Math.round(p.x);
+        const y = Math.round(p.y);
+
+        // Move the cursor
+        ghost.setAttribute('transform', `translate(${x}, ${y})`);
+        coordsTxt.innerText = `X: ${x}, Y: ${y}`;
+
+        const valid = isInside(x, y) && !isBlocked(x, y);
+        
+        if (valid) {
+            statusTxt.innerText = "VALID"; statusTxt.style.color = "#00ffcc";
+            ghost.setAttribute('stroke', '#00ffcc');
+        } else {
+            statusTxt.innerText = "OUT OF BOUNDS"; statusTxt.style.color = "red";
+            ghost.setAttribute('stroke', 'red');
+        }
+    });
+
+    svg.addEventListener('click', (e) => {
+        const CTM = svg.getScreenCTM();
+        const pt = svg.createSVGPoint();
+        pt.x = e.clientX; pt.y = e.clientY;
+        const p = pt.matrixTransform(CTM.inverse());
+        const x = Math.round(p.x), y = Math.round(p.y);
+
+        if (isInside(x, y) && !isBlocked(x, y)) {
+            const newHq = ghost.cloneNode(true);
+            newHq.removeAttribute('id');
+            newHq.setAttribute('fill', 'rgba(0, 255, 204, 0.8)');
+            document.getElementById('placed-hqs').appendChild(newHq);
+        }
+    });
+</script>
+</body>
+</html>
