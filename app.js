@@ -46,6 +46,8 @@ const EXTRA_FORBIDDEN = [
 ];
 
 const FIXED_SPACING = 1;
+const ALLIANCE_EXTRA_FLEX = 5;
+const ALLIANCE_TRIM_FLEX = 10;
 const CANDIDATE_PADDING = 3;
 const MAP_CENTER = { x: 500, y: 500 };
 const TILE_RADIUS = 0.58;
@@ -67,6 +69,7 @@ const ALLIANCE_COLORS = [
 
 const storageKey = "last-z-mudfiller-v2";
 const forbiddenSet = new Set(EXTRA_FORBIDDEN.map(([x, y]) => pointKey({ x, y })));
+const outerMudCellCache = new Map();
 const defaultState = {
   server: "",
   spacing: FIXED_SPACING,
@@ -74,22 +77,37 @@ const defaultState = {
     { id: makeId(), name: "Main Alliance", count: 20 },
     { id: makeId(), name: "Second Alliance", count: 10 },
   ],
+  hqNames: {},
 };
 
 let state = loadState();
 let enemyCandidateCount = 0;
 let enemyOpenCount = 0;
+let outerSupportPlan = [];
 let maxPlan = buildMaxPlan();
 let assignments = allocatePlan();
+let baseMapViewBox = null;
+let currentMapViewBox = null;
+const mapPointers = new Map();
+let mapGesture = null;
+let lastMapTap = 0;
+let lastTouchTap = 0;
+let usingTouchGesture = false;
+let mapInteractionArmed = false;
 
 const allianceList = document.querySelector("#alliance-list");
 const statGrid = document.querySelector("#stat-grid");
+const mapFrame = document.querySelector(".map-frame");
+const mudSvg = document.querySelector("#mud-svg");
 const mudLayer = document.querySelector("#mud-layer");
 const legend = document.querySelector("#legend");
 const assignmentTable = document.querySelector("#assignment-table");
 const serverNumber = document.querySelector("#server-number");
 const toast = document.querySelector("#toast");
 const capitalImage = document.querySelector("#capital-image");
+const configFileInput = document.querySelector("#config-file");
+const downloadFallback = document.querySelector("#download-fallback");
+let downloadFallbackUrl = "";
 
 capitalImage.addEventListener("error", () => {
   capitalImage.hidden = true;
@@ -109,6 +127,7 @@ function loadState() {
       alliances: stored.alliances.length
         ? stored.alliances.map((alliance) => ({ ...alliance, id: alliance.id || makeId() }))
         : structuredClone(defaultState.alliances),
+      hqNames: stored.hqNames && typeof stored.hqNames === "object" ? stored.hqNames : {},
     };
   } catch {
     return structuredClone(defaultState);
@@ -169,11 +188,60 @@ function isInsidePolygon(point, polygon) {
   return inside;
 }
 
+function isOuterMudCell(point) {
+  const key = pointKey(point);
+  if (outerMudCellCache.has(key)) return outerMudCellCache.get(key);
+
+  const isMud = isInsidePolygon(point, OUTER_MUD) || tileIntersectsPolygon(point, OUTER_MUD);
+  outerMudCellCache.set(key, isMud);
+  return isMud;
+}
+
+function tileIntersectsPolygon(point, polygon) {
+  const tile = projectedHexVertices(point);
+  const projectedPolygon = polygon.map(projectCoordinate);
+
+  return polygonsIntersect(tile, projectedPolygon);
+}
+
+function projectedHexVertices(point) {
+  const center = projectCoordinate(point);
+  return Array.from({ length: 6 }, (_, index) => {
+    const angle = (Math.PI / 180) * (60 * index - 30);
+    return {
+      x: center.x + Math.cos(angle) * TILE_RADIUS,
+      y: center.y + Math.sin(angle) * TILE_RADIUS,
+    };
+  });
+}
+
+function polygonsIntersect(a, b) {
+  if (a.some((point) => isInsidePolygon(point, b)) || b.some((point) => isInsidePolygon(point, a))) {
+    return true;
+  }
+
+  return a.some((startA, indexA) => {
+    const endA = a[(indexA + 1) % a.length];
+    return b.some((startB, indexB) => segmentsIntersect(startA, endA, startB, b[(indexB + 1) % b.length]));
+  });
+}
+
+function segmentsIntersect(a, b, c, d) {
+  const direction = (p, q, r) => (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x);
+  const d1 = direction(a, b, c);
+  const d2 = direction(a, b, d);
+  const d3 = direction(c, d, a);
+  const d4 = direction(c, d, b);
+
+  if (((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0))) {
+    return true;
+  }
+
+  return pointOnSegment(c, a, b) || pointOnSegment(d, a, b) || pointOnSegment(a, c, d) || pointOnSegment(b, c, d);
+}
+
 function isValidMudCell(point) {
-  return (
-    isInsidePolygon(point, OUTER_MUD) &&
-    !isBlockedCell(point)
-  );
+  return isOuterMudCell(point) && !isBlockedCell(point);
 }
 
 function isBlockedCell(point) {
@@ -183,7 +251,7 @@ function isBlockedCell(point) {
 function isValidDefensePlacement(candidate) {
   return (
     candidate.cells.every(isValidMudCell) &&
-    candidate.buffer.every((cell) => isInsidePolygon(cell, OUTER_MUD) || isBlockedCell(cell))
+    candidate.buffer.every((cell) => isOuterMudCell(cell) || isBlockedCell(cell))
   );
 }
 
@@ -215,6 +283,7 @@ function buildCandidate(anchor, spacing = state.spacing) {
   const distance = Math.hypot((center.x - 500) * 1.7, center.y - 500);
   const angle = Math.atan2(center.y - 500, center.x - 500);
   const innerDistance = distanceToInnerWall(cells);
+  const laneOrder = angleOrderValue(angle);
 
   return {
     id: pointKey(anchor),
@@ -227,6 +296,7 @@ function buildCandidate(anchor, spacing = state.spacing) {
     distance,
     angle,
     innerDistance,
+    laneOrder,
   };
 }
 
@@ -275,6 +345,7 @@ function distanceToInnerWall(cells) {
   }, Number.POSITIVE_INFINITY);
 }
 
+
 function coordinateBounds(points, padding = 0) {
   return {
     minX: Math.min(...points.map((point) => point.x)) - padding,
@@ -285,6 +356,7 @@ function coordinateBounds(points, padding = 0) {
 }
 
 function buildMaxPlan() {
+  outerSupportPlan = buildOuterSupportHqs();
   const defenderCandidates = buildPlacementCandidates(state.spacing, "defense");
   const enemyCandidates = buildPlacementCandidates(0, "enemy");
   enemyCandidateCount = enemyCandidates.length;
@@ -293,11 +365,20 @@ function buildMaxPlan() {
 
   const bestPlan = variants
     .map((plan) => buildSealedPlan(plan, state.spacing, enemyCandidates))
-    .map((plan) => ({ plan, enemyOpen: countEnemyOpeningsForPlacements(plan, enemyCandidates) }))
+    .map((plan) => pruneSealedPlan(plan, enemyCandidates))
+    .map((plan) => improveSealedPlanLayout(plan, enemyCandidates, defenderCandidates))
+    .map((plan) => pruneSealedPlan(plan, enemyCandidates))
+    .map((plan) => improveSealedPlanLayout(plan, enemyCandidates, defenderCandidates))
+    .map((plan) => ({
+      plan,
+      enemyOpen: countEnemyOpeningsForPlacements(plan, enemyCandidates),
+      quality: planLayoutPenalty(plan),
+    }))
     .sort(
     (a, b) =>
       a.enemyOpen - b.enemyOpen ||
       a.plan.length - b.plan.length ||
+      a.quality - b.quality ||
       averagePlanDistance(a.plan) - averagePlanDistance(b.plan),
   )[0].plan;
 
@@ -307,13 +388,14 @@ function buildMaxPlan() {
 function buildPlacementCandidates(spacing, placementType = "defense") {
   const candidates = [];
   const bounds = coordinateBounds(OUTER_MUD, CANDIDATE_PADDING);
+  const supportCells = placementType === "defense" ? outerSupportCellKeys() : new Set();
 
   for (let y = bounds.minY; y <= bounds.maxY; y += 1) {
     for (let x = bounds.minX; x <= bounds.maxX; x += 1) {
       const candidate = buildCandidate({ x, y }, spacing);
       const isValid =
         placementType === "enemy" ? isValidEnemyOpening(candidate) : isValidDefensePlacement(candidate);
-      if (isValid) {
+      if (isValid && !candidate.cellKeys.some((key) => supportCells.has(key))) {
         candidates.push(candidate);
       }
     }
@@ -345,7 +427,7 @@ function buildCoveragePlan(defenderCandidates, enemyCandidates) {
       if (candidate.cellKeys.some((key) => reserved.has(key))) return;
 
       const blockedIds = blockedEnemyIdsFor(candidate, enemyByCell, remainingEnemyIds);
-      if (!bestCandidate || isBetterCoverageCandidate(candidate, blockedIds, bestCandidate, bestBlockedIds, remainingEnemyIds.size)) {
+      if (!bestCandidate || isBetterCoverageCandidate(candidate, blockedIds, bestCandidate, bestBlockedIds, remainingEnemyIds.size, plan)) {
         bestCandidate = candidate;
         bestBlockedIds = blockedIds;
       }
@@ -417,7 +499,7 @@ function buildSealedPlan(startingPlan, preferredSpacing, enemyCandidates) {
 
         const blockedIds = blockedEnemyIdsFor(candidate, enemyByCell, openEnemyIds);
         if (!blockedIds.size) return;
-        if (!bestCandidate || isBetterCoverageCandidate(candidate, blockedIds, bestCandidate, bestBlockedIds, openEnemyIds.size)) {
+        if (!bestCandidate || isBetterCoverageCandidate(candidate, blockedIds, bestCandidate, bestBlockedIds, openEnemyIds.size, plan)) {
           bestCandidate = candidate;
           bestBlockedIds = blockedIds;
         }
@@ -436,6 +518,105 @@ function buildSealedPlan(startingPlan, preferredSpacing, enemyCandidates) {
   return plan;
 }
 
+function improveSealedPlanLayout(plan, enemyCandidates, defenderCandidates) {
+  if (openEnemyIdsForPlacements(plan, enemyCandidates).size) return plan;
+
+  let improved = [...plan];
+  let currentPenalty = planLayoutPenalty(improved);
+
+  for (let pass = 0; pass < 4; pass += 1) {
+    let changed = false;
+    const worstPlacements = [...improved]
+      .map((placement) => ({
+        placement,
+        penalty: sealedPlanClumpPenalty(
+          placement,
+          improved.filter((item) => item.id !== placement.id),
+        ) + innerCleanlinessWeight(placement) * 120,
+      }))
+      .sort((a, b) => b.penalty - a.penalty)
+      .slice(0, 18);
+
+    for (const { placement: target } of worstPlacements) {
+      const withoutTarget = improved.filter((placement) => placement.id !== target.id);
+      const reserved = reservedKeysForPlacements(withoutTarget, state.spacing);
+      const selectedIds = new Set(withoutTarget.map((placement) => placement.id));
+      const options = defenderCandidates
+        .filter((candidate) => candidate.id !== target.id && !selectedIds.has(candidate.id))
+        .filter((candidate) => !candidate.cellKeys.some((key) => reserved.has(key)))
+        .sort((a, b) => coverageCandidateScore(a, withoutTarget) - coverageCandidateScore(b, withoutTarget))
+        .slice(0, 90);
+
+      for (const option of options) {
+        const proposal = [...withoutTarget, option];
+        if (openEnemyIdsForPlacements(proposal, enemyCandidates).size) continue;
+
+        const proposalPenalty = planLayoutPenalty(proposal);
+        if (proposalPenalty < currentPenalty - 0.001) {
+          improved = proposal;
+          currentPenalty = proposalPenalty;
+          changed = true;
+          break;
+        }
+      }
+
+      if (changed) break;
+    }
+
+    if (!changed) break;
+  }
+
+  return improved;
+}
+
+function pruneSealedPlan(plan, enemyCandidates) {
+  if (openEnemyIdsForPlacements(plan, enemyCandidates).size) return plan;
+
+  const sorters = [
+    (placements) => [...placements].sort((a, b) => redundancyScore(b, placements) - redundancyScore(a, placements)),
+    (placements) => [...placements].sort((a, b) => b.innerDistance - a.innerDistance || b.distance - a.distance),
+    (placements) => [...placements].sort((a, b) => b.distance - a.distance || b.innerDistance - a.innerDistance),
+    (placements) => [...placements].sort((a, b) => b.anchor.y - a.anchor.y || b.anchor.x - a.anchor.x),
+  ];
+
+  return sorters
+    .map((sorter) => pruneSealedPlanOnce(plan, enemyCandidates, sorter))
+    .sort((a, b) => a.length - b.length || averagePlanDistance(a) - averagePlanDistance(b))[0];
+}
+
+function pruneSealedPlanOnce(plan, enemyCandidates, sorter) {
+  const pruned = [...plan];
+  let changed = true;
+
+  while (changed) {
+    changed = false;
+    const removalOrder = sorter(pruned);
+
+    for (const placement of removalOrder) {
+      const candidate = pruned.filter((item) => item.id !== placement.id);
+      if (!openEnemyIdsForPlacements(candidate, enemyCandidates).size) {
+        pruned.splice(pruned.findIndex((item) => item.id === placement.id), 1);
+        changed = true;
+        break;
+      }
+    }
+  }
+
+  return pruned;
+}
+
+function redundancyScore(placement, placements) {
+  const neighbors = placements.filter((item) => item.id !== placement.id);
+  const nearest = neighbors.reduce(
+    (closest, item) => Math.min(closest, hexDistance(placement.anchor, item.anchor)),
+    Number.POSITIVE_INFINITY,
+  );
+  const nearbyCount = neighbors.filter((item) => hexDistance(placement.anchor, item.anchor) <= 5).length;
+  const nearestPenalty = Number.isFinite(nearest) ? Math.max(0, 7 - nearest) * 16 : 0;
+
+  return nearbyCount * 12 + nearestPenalty + innerCleanlinessWeight(placement) * 18 + placement.innerDistance * 0.2;
+}
+
 function reservedKeysForPlacements(placements, spacing) {
   const reserved = new Set();
 
@@ -446,11 +627,11 @@ function reservedKeysForPlacements(placements, spacing) {
   return reserved;
 }
 
-function openEnemyIdsForPlacements(placements, enemyCandidates) {
+function openEnemyIdsForPlacements(placements, enemyCandidates, supportPlacements = outerSupportPlan) {
   const occupied = new Set();
   const openEnemyIds = new Set();
 
-  placements.forEach((placement) => placement.cellKeys.forEach((key) => occupied.add(key)));
+  [...placements, ...supportPlacements].forEach((placement) => placement.cellKeys.forEach((key) => occupied.add(key)));
   enemyCandidates.forEach((candidate) => {
     if (candidate.cellKeys.every((key) => !occupied.has(key))) openEnemyIds.add(candidate.id);
   });
@@ -484,17 +665,19 @@ function blockedEnemyIdsFor(candidate, enemyByCell, remainingEnemyIds) {
   return blockedIds;
 }
 
-function isBetterCoverageCandidate(candidate, blockedIds, bestCandidate, bestBlockedIds, remainingEnemyCount) {
+function isBetterCoverageCandidate(candidate, blockedIds, bestCandidate, bestBlockedIds, remainingEnemyCount, currentPlacements = []) {
   if (remainingEnemyCount > 0 && blockedIds.size !== bestBlockedIds.size) {
     return blockedIds.size > bestBlockedIds.size;
   }
 
+  const candidateScore = coverageCandidateScore(candidate, currentPlacements);
+  const bestScore = coverageCandidateScore(bestCandidate, currentPlacements);
+  if (candidateScore !== bestScore) return candidateScore < bestScore;
+
   return (
     candidate.innerDistance < bestCandidate.innerDistance ||
     (candidate.innerDistance === bestCandidate.innerDistance && candidate.distance < bestCandidate.distance) ||
-    (candidate.innerDistance === bestCandidate.innerDistance &&
-      candidate.distance === bestCandidate.distance &&
-      candidate.angle < bestCandidate.angle) ||
+    (candidate.innerDistance === bestCandidate.innerDistance && candidate.distance === bestCandidate.distance && candidate.angle < bestCandidate.angle) ||
     (candidate.innerDistance === bestCandidate.innerDistance &&
       candidate.distance === bestCandidate.distance &&
       candidate.angle === bestCandidate.angle &&
@@ -505,6 +688,26 @@ function isBetterCoverageCandidate(candidate, blockedIds, bestCandidate, bestBlo
       candidate.anchor.y === bestCandidate.anchor.y &&
       candidate.anchor.x < bestCandidate.anchor.x)
   );
+}
+
+function coverageCandidateScore(candidate, currentPlacements = []) {
+  return candidate.innerDistance * 9 + candidate.distance * 0.08 + sealedPlanClumpPenalty(candidate, currentPlacements);
+}
+
+function sealedPlanClumpPenalty(candidate, currentPlacements = []) {
+  const weight = innerCleanlinessWeight(candidate);
+
+  return currentPlacements.reduce((penalty, placement) => {
+    const distance = hexDistance(candidate.anchor, placement.anchor);
+    if (distance > 12) return penalty;
+    const otherWeight = innerCleanlinessWeight(placement);
+    const combinedWeight = Math.max(weight, otherWeight);
+    const bothNearInner = weight > 0.75 && otherWeight > 0.75;
+    const innerMultiplier = bothNearInner ? 2.35 : 1;
+    const hardPenalty = distance <= 6 ? (7 - distance) * 5200 * combinedWeight * innerMultiplier : 0;
+    const softPenalty = (13 - distance) * 760 * combinedWeight * innerMultiplier;
+    return penalty + hardPenalty + softPenalty;
+  }, 0);
 }
 
 function isPlacementBefore(a, b) {
@@ -531,10 +734,10 @@ function countEnemyOpenings(currentAssignments) {
   );
 }
 
-function countEnemyOpeningsForPlacements(placements, enemyCandidates) {
+function countEnemyOpeningsForPlacements(placements, enemyCandidates, supportPlacements = outerSupportPlan) {
   const occupied = new Set();
 
-  placements.forEach((placement) => placement.cellKeys.forEach((key) => occupied.add(key)));
+  [...placements, ...supportPlacements].forEach((placement) => placement.cellKeys.forEach((key) => occupied.add(key)));
 
   const openEnemyCandidates = enemyCandidates.filter((enemyCandidate) =>
     enemyCandidate.cellKeys.every((key) => !occupied.has(key)),
@@ -577,6 +780,322 @@ function averagePlanDistance(plan) {
   return plan.reduce((total, placement) => total + placement.distance, 0) / plan.length;
 }
 
+function planLayoutPenalty(plan) {
+  return plan.reduce((total, placement, index) => {
+    let penalty = 0;
+    for (let otherIndex = index + 1; otherIndex < plan.length; otherIndex += 1) {
+      const other = plan[otherIndex];
+      const distance = hexDistance(placement.anchor, other.anchor);
+      if (distance > 12) continue;
+      const innerWeight = Math.max(innerCleanlinessWeight(placement), innerCleanlinessWeight(other));
+      const bothNearInner = innerCleanlinessWeight(placement) > 0.75 && innerCleanlinessWeight(other) > 0.75;
+      const innerMultiplier = bothNearInner ? 2.2 : 1;
+      if (distance <= 5) penalty += (6 - distance) * 1200 * innerWeight * innerMultiplier;
+      penalty += (13 - distance) * 180 * innerWeight * innerMultiplier;
+    }
+
+    return total + penalty + placement.innerDistance * 0.3;
+  }, 0);
+}
+
+function sealAssignmentOpenings(currentAssignments) {
+  const sealedAssignments = [...currentAssignments];
+  const enemyCandidates = buildPlacementCandidates(0, "enemy");
+  const activeAlliances = state.alliances.filter((alliance) => alliance.count > 0);
+  const laneMeta = buildAllianceLaneMeta(activeAlliances);
+  const metaByAllianceId = new Map(laneMeta.map((meta) => [meta.alliance.id, meta]));
+  const placementsByAllianceId = new Map();
+
+  sealedAssignments
+    .filter((assignment) => !assignment.shortfall)
+    .forEach((assignment) => {
+      if (!placementsByAllianceId.has(assignment.alliance.id)) placementsByAllianceId.set(assignment.alliance.id, []);
+      placementsByAllianceId.get(assignment.alliance.id).push(assignment);
+    });
+
+  const placeholders = sealedAssignments
+    .map((assignment, index) => ({ assignment, index }))
+    .filter(({ assignment }) => assignment.shortfall)
+    .sort((a, b) => Number(b.assignment.flexTrim) - Number(a.assignment.flexTrim) || a.assignment.allianceIndex - b.assignment.allianceIndex || a.assignment.number - b.assignment.number);
+  const usedIds = new Set(sealedAssignments.filter((assignment) => !assignment.shortfall).map((assignment) => assignment.id));
+  const available = maxPlan.filter((placement) => !usedIds.has(placement.id));
+  const enemyByCell = enemyCellIndex(enemyCandidates);
+  let activePlacements = sealedAssignments.filter((assignment) => !assignment.shortfall);
+  let openEnemyIds = openEnemyIdsForPlacements(activePlacements, enemyCandidates);
+
+  while (openEnemyIds.size && available.length) {
+    const occupied = new Set(activePlacements.flatMap((placement) => placement.cellKeys));
+    let best = null;
+
+    available.forEach((placement, placementIndex) => {
+      if (placement.cellKeys.some((key) => occupied.has(key))) return;
+      const blockedIds = blockedEnemyIdsFor(placement, enemyByCell, openEnemyIds);
+      if (!blockedIds.size) return;
+
+      const allianceOptions = sealingAllianceOptions(placement, activeAlliances, laneMeta, placementsByAllianceId, placeholders, true);
+
+      allianceOptions.forEach((option) => {
+        const picked = placementsByAllianceId.get(option.alliance.id) || [];
+        const laneScore = option.meta ? allianceLaneScore(placement, option.meta, picked) : placement.innerDistance;
+        const fillBalancePenalty = option.placeholder ? 0 : 2800000;
+        const score = -blockedIds.size * 10000000 + fillBalancePenalty + laneScore + option.allianceIndex * 0.01;
+        if (!best || score < best.score) {
+          best = { ...option, placement, placementIndex, blockedIds, score };
+        }
+      });
+    });
+
+    if (!best) break;
+
+    const assignment = best.placeholder
+      ? sealedAssignments[best.placeholder.index]
+      : {
+          alliance: best.alliance,
+          allianceIndex: best.allianceIndex,
+          color: ALLIANCE_COLORS[best.allianceIndex % ALLIANCE_COLORS.length],
+          number: (placementsByAllianceId.get(best.alliance.id)?.length || 0) + 1,
+          extraFill: true,
+          flexAdjusted: true,
+        };
+
+    Object.assign(assignment, best.placement);
+    assignment.shortfall = false;
+    assignment.flexTrim = false;
+    assignment.flexAdjusted = assignment.flexAdjusted || !best.placeholder;
+    if (!best.placeholder) sealedAssignments.push(assignment);
+    if (!placementsByAllianceId.has(assignment.alliance.id)) placementsByAllianceId.set(assignment.alliance.id, []);
+    placementsByAllianceId.get(assignment.alliance.id).push(assignment);
+    activePlacements.push(assignment);
+    available.splice(best.placementIndex, 1);
+    if (best.placeholder) placeholders.splice(best.placeholderIndex, 1);
+    openEnemyIds = openEnemyIdsForPlacements(activePlacements, enemyCandidates);
+  }
+
+  return sealedAssignments;
+}
+
+function sealingAllianceOptions(placement, activeAlliances, laneMeta, placementsByAllianceId, placeholders, requireLane) {
+  const order = laneOrderValue(placement);
+  const options = [];
+
+  activeAlliances.forEach((alliance) => {
+    const meta = laneMeta.find((item) => item.alliance.id === alliance.id);
+    const currentCount = placementsByAllianceId.get(alliance.id)?.length || 0;
+    const overflow = meta ? laneOverflow(order, meta) : Number.POSITIVE_INFINITY;
+    const inLane = meta ? overflow <= flexibleLaneOverflow(meta) : false;
+    if (requireLane && !inLane) return;
+    if (currentCount >= alliance.count + ALLIANCE_EXTRA_FLEX) return;
+
+    const placeholderIndex = placeholders.findIndex((placeholder) => placeholder.assignment.alliance.id === alliance.id);
+    const allianceIndex = state.alliances.findIndex((item) => item.id === alliance.id);
+    options.push({
+      alliance,
+      allianceIndex,
+      meta,
+      inLane,
+      placeholder: placeholderIndex >= 0 ? placeholders[placeholderIndex] : null,
+      placeholderIndex,
+    });
+  });
+
+  return options;
+}
+
+function reduceCleanSealedAssignments(currentAssignments) {
+  const enemyCandidates = buildPlacementCandidates(0, "enemy");
+  const defenseCandidates = buildPlacementCandidates(state.spacing, "defense");
+  const enemyByCell = enemyCellIndex(enemyCandidates);
+  const requested = requestedTotal();
+  const minimumPlaced = Math.max(0, requested - ALLIANCE_TRIM_FLEX);
+  const reducedAssignments = [...currentAssignments];
+  let activePlacements = reducedAssignments.filter((assignment) => !assignment.shortfall);
+
+  if (openEnemyIdsForPlacements(activePlacements, enemyCandidates).size) return currentAssignments;
+
+  while (activePlacements.length > minimumPlaced) {
+    const removalOptions = activePlacements
+      .map((assignment) => {
+        const others = activePlacements.filter((placement) => placement.id !== assignment.id);
+        return {
+          assignment,
+          penalty: sealedPlanClumpPenalty(assignment, others) + innerCleanlinessWeight(assignment) * 450,
+        };
+      })
+      .filter((option) => option.penalty > 0)
+      .sort((a, b) => b.penalty - a.penalty)
+      .slice(0, 24);
+
+    let changed = false;
+
+    for (const { assignment } of removalOptions) {
+      const proposal = activePlacements.filter((placement) => placement.id !== assignment.id);
+      const openAfterRemoval = openEnemyIdsForPlacements(proposal, enemyCandidates);
+      const stored = reducedAssignments.find((item) => item === assignment);
+      if (!stored) continue;
+
+      if (!openAfterRemoval.size) {
+        markAssignmentAsTrimmed(stored);
+        changed = true;
+        break;
+      }
+
+      const move = findSealingMoveAfterRemoval(proposal, openAfterRemoval, enemyCandidates, enemyByCell, defenseCandidates);
+      if (!move) continue;
+
+      markAssignmentAsTrimmed(stored);
+      Object.assign(move.assignment, move.placement);
+      move.assignment.flexAdjusted = true;
+      changed = true;
+      break;
+    }
+
+    if (!changed) break;
+    activePlacements = reducedAssignments.filter((assignment) => !assignment.shortfall);
+  }
+
+  return reducedAssignments;
+}
+
+function markAssignmentAsTrimmed(assignment) {
+  assignment.shortfall = true;
+  assignment.flexTrim = true;
+  assignment.flexAdjusted = true;
+}
+
+function findSealingMoveAfterRemoval(activePlacements, openEnemyIds, enemyCandidates, enemyByCell, defenseCandidates) {
+  const movers = [...activePlacements]
+
+    .map((assignment) => {
+      const others = activePlacements.filter((placement) => placement.id !== assignment.id);
+      return {
+        assignment,
+        penalty: sealedPlanClumpPenalty(assignment, others) + innerCleanlinessWeight(assignment) * 250,
+      };
+    })
+    .sort((a, b) => b.penalty - a.penalty)
+    .slice(0, 18);
+
+  for (const { assignment } of movers) {
+    const others = activePlacements.filter((placement) => placement.id !== assignment.id);
+    const occupied = new Set(others.flatMap((placement) => placement.cellKeys));
+    const options = defenseCandidates
+      .filter((candidate) => candidate.id !== assignment.id)
+      .filter((candidate) => !candidate.cellKeys.some((key) => occupied.has(key)))
+      .map((candidate) => ({
+        candidate,
+        blocked: blockedEnemyIdsFor(candidate, enemyByCell, openEnemyIds).size,
+      }))
+      .filter((option) => option.blocked)
+      .sort((a, b) => b.blocked - a.blocked || coverageCandidateScore(a.candidate, others) - coverageCandidateScore(b.candidate, others))
+      .slice(0, 70);
+
+    for (const { candidate } of options) {
+      const moved = { ...assignment, ...candidate, flexAdjusted: true };
+      const proposal = [...others, moved];
+      if (openEnemyIdsForPlacements(proposal, enemyCandidates).size) continue;
+      if (planLayoutPenalty(proposal) > planLayoutPenalty(activePlacements) + 100000) continue;
+      return { assignment, placement: candidate };
+    }
+  }
+
+  return null;
+}
+
+function rebalanceAllianceOwnership(currentAssignments) {
+  const activePlacements = currentAssignments.filter((assignment) => !assignment.shortfall);
+  const activeAlliances = state.alliances.filter((alliance) => alliance.count > 0);
+  if (!activePlacements.length || !activeAlliances.length) return currentAssignments;
+
+  const targets = flexibleAllianceTargets(activeAlliances, activePlacements.length);
+  const orderedPlacements = [...activePlacements].sort((a, b) =>
+    laneOrderValue(a) - laneOrderValue(b) ||
+    a.innerDistance - b.innerDistance ||
+    a.distance - b.distance ||
+    a.anchor.y - b.anchor.y ||
+    a.anchor.x - b.anchor.x,
+  );
+
+  const balanced = [];
+  let cursor = 0;
+
+  state.alliances.forEach((alliance, allianceIndex) => {
+    const filledTarget = targets.get(alliance.id) || 0;
+    const color = ALLIANCE_COLORS[allianceIndex % ALLIANCE_COLORS.length];
+    const placements = orderedPlacements
+      .slice(cursor, cursor + filledTarget)
+      .sort((a, b) => (isPlacementBefore(a, b) ? -1 : isPlacementBefore(b, a) ? 1 : 0));
+
+    placements.forEach((placement, index) => {
+      balanced.push({
+        ...placement,
+        alliance,
+        allianceIndex,
+        color,
+        number: index + 1,
+        shortfall: false,
+        flexAdjusted: placement.flexAdjusted || filledTarget !== alliance.count,
+        flexTrim: false,
+      });
+    });
+
+    for (let index = filledTarget; index < alliance.count; index += 1) {
+      balanced.push({
+        alliance,
+        allianceIndex,
+        color,
+        shortfall: true,
+        flexTrim: true,
+        flexAdjusted: true,
+        number: index + 1,
+      });
+    }
+
+    cursor += filledTarget;
+  });
+
+  return balanced;
+}
+
+function flexibleAllianceTargets(activeAlliances, filledCount) {
+  const targets = new Map(activeAlliances.map((alliance) => [alliance.id, alliance.count]));
+  let total = activeAlliances.reduce((sum, alliance) => sum + alliance.count, 0);
+
+  if (total > filledCount) {
+    let remaining = total - filledCount;
+    for (let index = activeAlliances.length - 1; index >= 0 && remaining > 0; index -= 1) {
+      const alliance = activeAlliances[index];
+      const current = targets.get(alliance.id) || 0;
+      const minimum = Math.max(0, alliance.count - ALLIANCE_TRIM_FLEX);
+      const remove = Math.min(remaining, current - minimum);
+      targets.set(alliance.id, current - remove);
+      remaining -= remove;
+    }
+  }
+
+  total = [...targets.values()].reduce((sum, count) => sum + count, 0);
+
+  if (total < filledCount) {
+    let remaining = filledCount - total;
+    for (let index = 0; index < activeAlliances.length && remaining > 0; index += 1) {
+      const alliance = activeAlliances[index];
+      const current = targets.get(alliance.id) || 0;
+      const maximum = alliance.count + ALLIANCE_EXTRA_FLEX;
+      const add = Math.min(remaining, maximum - current);
+      targets.set(alliance.id, current + add);
+      remaining -= add;
+    }
+
+    for (let index = 0; index < activeAlliances.length && remaining > 0; index += 1) {
+      const alliance = activeAlliances[index];
+      const current = targets.get(alliance.id) || 0;
+      targets.set(alliance.id, current + 1);
+      remaining -= 1;
+    }
+  }
+
+  return targets;
+}
+
 function countOpenDefenseSlots(currentAssignments) {
   const assigned = currentAssignments.filter((assignment) => !assignment.shortfall).length;
   return Math.max(0, maxPlan.length - assigned);
@@ -616,17 +1135,17 @@ function cleanAllianceRows() {
   }
 }
 
-function allocatePlan() {
+function allocatePlan({ allowTrimming = true } = {}) {
   cleanAllianceRows();
   const allocations = [];
   const activeAlliances = state.alliances.filter((alliance) => alliance.count > 0);
-  const requested = activeAlliances.reduce((sum, alliance) => sum + alliance.count, 0);
-  const selectedPlacements = maxPlan.slice(0, requested).map((placement) => ({ ...placement }));
-  const activeMeta = assignContiguousAllianceLanes(activeAlliances, selectedPlacements);
+  const selectedPlacements = maxPlan.map((placement) => ({ ...placement }));
+  const activeMeta = assignContiguousAllianceLanes(activeAlliances, selectedPlacements, { allowTrimming });
 
   state.alliances.forEach((alliance, allianceIndex) => {
     const color = ALLIANCE_COLORS[allianceIndex % ALLIANCE_COLORS.length];
-    const placements = activeMeta.find((meta) => meta.alliance.id === alliance.id)?.placements || [];
+    const meta = activeMeta.find((item) => item.alliance.id === alliance.id);
+    const placements = meta?.placements || [];
 
     placements.forEach((placement, index) => {
       allocations.push({
@@ -644,6 +1163,8 @@ function allocatePlan() {
         allianceIndex,
         color,
         shortfall: true,
+        flexTrim: Boolean(meta?.trimmedForQuality),
+        flexAdjusted: Boolean(meta?.flexAdjusted),
         number: index + 1,
       });
     }
@@ -652,29 +1173,44 @@ function allocatePlan() {
   return allocations;
 }
 
-function assignContiguousAllianceLanes(activeAlliances, placements) {
+function assignContiguousAllianceLanes(activeAlliances, placements, { allowTrimming = true } = {}) {
   const activeMeta = buildAllianceLaneMeta(activeAlliances);
-  const sortedPlacements = [...placements].sort(
-    (a, b) =>
-      laneOrderValue(a) - laneOrderValue(b) ||
-      a.innerDistance - b.innerDistance ||
-      a.distance - b.distance,
-  );
-  let cursor = 0;
+  const available = [...placements];
 
   activeMeta.forEach((meta) => {
-    meta.placements = sortedPlacements
-      .slice(cursor, cursor + meta.alliance.count)
-      .sort((a, b) => (isPlacementBefore(a, b) ? -1 : isPlacementBefore(b, a) ? 1 : 0));
-    cursor += meta.alliance.count;
+    const picked = [];
+    const requiredMinimum = allowTrimming ? Math.max(0, meta.alliance.count - ALLIANCE_TRIM_FLEX) : meta.alliance.count;
+
+    const targetMaximum = meta.alliance.count;
+
+    while (picked.length < targetMaximum && available.length) {
+      const best = findBestLanePlacement(available, meta, (candidate) => allianceLaneScore(candidate, meta, picked));
+      if (!best) break;
+      if (picked.length >= meta.alliance.count && !shouldAddFlexiblePlacement(best.placement, meta, picked)) {
+        meta.flexAdjusted = true;
+        break;
+      }
+      if (picked.length >= requiredMinimum && shouldTrimLanePlacement(best.placement, meta, picked)) {
+        meta.trimmedForQuality = true;
+        meta.flexAdjusted = true;
+        break;
+      }
+      picked.push(available.splice(best.index, 1)[0]);
+    }
+
+    meta.placements = picked.sort((a, b) => (isPlacementBefore(a, b) ? -1 : isPlacementBefore(b, a) ? 1 : 0));
   });
 
   return activeMeta;
 }
 
 function laneOrderValue(placement) {
+  return angleOrderValue(placement.angle);
+}
+
+function angleOrderValue(angle) {
   const startAngle = -Math.PI / 2;
-  let value = placement.angle - startAngle;
+  let value = angle - startAngle;
   while (value < 0) value += Math.PI * 2;
   while (value >= Math.PI * 2) value -= Math.PI * 2;
   return value;
@@ -682,15 +1218,20 @@ function laneOrderValue(placement) {
 
 function buildAllianceLaneMeta(activeAlliances) {
   const totalRequested = activeAlliances.reduce((sum, alliance) => sum + alliance.count, 0);
-  let cursor = -Math.PI / 2;
+  let cursor = 0;
 
   return activeAlliances.map((alliance) => {
     const width = (Math.PI * 2 * alliance.count) / Math.max(1, totalRequested);
-    const targetAngle = normalizeAngle(cursor + width / 2);
+    const targetOrder = cursor + width / 2;
     const meta = {
       alliance,
-      targetAngle,
+      startOrder: cursor,
+      endOrder: cursor + width,
+      width,
+      targetOrder,
+      targetAngle: normalizeAngle(-Math.PI / 2 + targetOrder),
       halfWidth: width / 2,
+      bandCount: Math.min(14, Math.max(3, Math.ceil(alliance.count / 4))),
       placements: [],
     };
 
@@ -699,11 +1240,110 @@ function buildAllianceLaneMeta(activeAlliances) {
   });
 }
 
-function allianceLaneScore(placement, meta) {
+function allianceLaneScore(placement, meta, picked = []) {
   const lane = laneMetrics(placement, meta.targetAngle);
-  const angleGap = angleDifference(placement.angle, meta.targetAngle);
-  const overflow = Math.max(0, angleGap - meta.halfWidth);
-  return overflow * 10000 + angleGap * 100 + lane.behindPenalty + lane.lateral * 0.8 + lane.radial * 0.2;
+  const order = laneOrderValue(placement);
+  const overflow = laneOverflow(order, meta);
+  const orderGap = angleDifference(order, meta.targetOrder);
+  const band = laneBandIndex(order, meta);
+  const pickedInBand = picked.filter((item) => laneBandIndex(laneOrderValue(item), meta) === band).length;
+  const nearestLaneGap = picked.reduce(
+    (closest, item) => Math.min(closest, angleDifference(laneOrderValue(item), order)),
+    Number.POSITIVE_INFINITY,
+  );
+  const cleanlinessWeight = innerCleanlinessWeight(placement);
+  const closeNeighborPenalty = Number.isFinite(nearestLaneGap)
+    ? Math.max(0, meta.width / Math.max(4, meta.bandCount) - nearestLaneGap) * 2400
+    : 0;
+  const spatialPenalty = spatialClumpPenalty(placement, picked);
+
+  return (
+    overflow * laneOverflowPenalty(meta, placement) +
+    pickedInBand * 62000 * cleanlinessWeight +
+    closeNeighborPenalty * cleanlinessWeight +
+    spatialPenalty +
+    orderGap * (18 + cleanlinessWeight * 9) +
+    placement.innerDistance * 7 +
+    lane.lateral * 0.16 +
+    placement.distance * 0.06 +
+    lane.behindPenalty
+  );
+}
+
+function spatialClumpPenalty(placement, picked) {
+  const weight = innerCleanlinessWeight(placement);
+  return picked.reduce((penalty, other) => {
+    const distance = hexDistance(placement.anchor, other.anchor);
+    if (distance > 10) return penalty;
+    const otherWeight = innerCleanlinessWeight(other);
+    const combinedWeight = Math.max(weight, otherWeight);
+    const bothNearInner = weight > 0.75 && otherWeight > 0.75;
+    const innerMultiplier = bothNearInner ? 1.85 : 1;
+    const hardPenalty = distance <= 5 ? (6 - distance) * 4200 * combinedWeight * innerMultiplier : 0;
+    const softPenalty = (11 - distance) * 650 * combinedWeight * innerMultiplier;
+    return penalty + hardPenalty + softPenalty;
+  }, 0);
+}
+
+function innerCleanlinessWeight(placement) {
+  const nearInnerWall = 22;
+  const outerRelaxPoint = 46;
+  const normalized = Math.min(
+    1,
+    Math.max(0, (outerRelaxPoint - placement.innerDistance) / (outerRelaxPoint - nearInnerWall)),
+  );
+
+  return 0.05 + normalized * normalized * 3;
+}
+
+function shouldAddFlexiblePlacement(placement, meta, picked) {
+  if (!picked.length) return true;
+  const weight = innerCleanlinessWeight(placement);
+  if (weight > 0.55) return false;
+  return spatialClumpPenalty(placement, picked) < 650;
+}
+
+function shouldTrimLanePlacement(placement, meta, picked) {
+  if (!picked.length) return false;
+  const order = laneOrderValue(placement);
+  const band = laneBandIndex(order, meta);
+  const pickedInBand = picked.filter((item) => laneBandIndex(laneOrderValue(item), meta) === band).length;
+  const nearestLaneGap = picked.reduce(
+    (closest, item) => Math.min(closest, angleDifference(laneOrderValue(item), order)),
+    Number.POSITIVE_INFINITY,
+  );
+  const nearestHexDistance = picked.reduce(
+    (closest, item) => Math.min(closest, hexDistance(placement.anchor, item.anchor)),
+    Number.POSITIVE_INFINITY,
+  );
+  const minimumCleanGap = meta.width / Math.max(4, meta.bandCount);
+  const isInnerPressure = innerCleanlinessWeight(placement) > 0.75;
+  const isCrowdingBand = pickedInBand >= Math.max(2, Math.ceil((picked.length + 1) / meta.bandCount));
+  const isTooClose = Number.isFinite(nearestLaneGap) && nearestLaneGap < minimumCleanGap;
+  const isHexTooClose = Number.isFinite(nearestHexDistance) && nearestHexDistance <= (isInnerPressure ? 8 : 5);
+  const isSpatiallyClumped = spatialClumpPenalty(placement, picked) > 2200;
+
+  return isInnerPressure && (isCrowdingBand || isTooClose || isHexTooClose || isSpatiallyClumped);
+}
+
+function laneOverflow(order, meta) {
+  if (order < meta.startOrder) return meta.startOrder - order;
+  if (order >= meta.endOrder) return order - meta.endOrder;
+  return 0;
+}
+
+function flexibleLaneOverflow(meta) {
+  return Math.min(meta.width * 0.28, Math.PI / 10);
+}
+
+function laneOverflowPenalty(meta, placement) {
+  const innerWeight = innerCleanlinessWeight(placement);
+  return 240000 + innerWeight * 185000;
+}
+
+function laneBandIndex(order, meta) {
+  const relative = Math.min(Math.max(order - meta.startOrder, 0), Math.max(meta.width - 0.0001, 0));
+  return Math.min(meta.bandCount - 1, Math.floor((relative / Math.max(meta.width, 0.0001)) * meta.bandCount));
 }
 
 function laneMetrics(placement, targetAngle) {
@@ -720,6 +1360,33 @@ function laneMetrics(placement, targetAngle) {
     lateral,
     behindPenalty: radial < 0 ? 200 : 0,
   };
+}
+
+function findBestLanePlacement(available, meta, scorePlacement) {
+  const flexOverflow = flexibleLaneOverflow(meta);
+  const inLaneIndexes = available
+    .map((placement, index) => ({ placement, index }))
+    .filter(({ placement }) => laneOverflow(laneOrderValue(placement), meta) <= flexOverflow)
+    .map(({ index }) => index);
+  const indexes = inLaneIndexes.length ? inLaneIndexes : available.map((_, index) => index);
+  let best = null;
+  let bestScore = Number.POSITIVE_INFINITY;
+
+  indexes.forEach((index) => {
+    const score = scorePlacement(available[index]);
+    if (score < bestScore) {
+      bestScore = score;
+      best = { index, placement: available[index], score };
+    }
+  });
+
+  return best;
+}
+
+function removeBestLanePlacement(available, meta, scorePlacement) {
+  const best = findBestLanePlacement(available, meta, scorePlacement);
+  if (!best) return null;
+  return available.splice(best.index, 1)[0];
 }
 
 function removeBestPlacement(available, scorePlacement) {
@@ -754,8 +1421,18 @@ function renderAll() {
   state.spacing = normalizeSpacing(state.spacing);
   maxPlan = buildMaxPlan();
   serverNumber.value = state.server;
-  assignments = allocatePlan();
+  assignments = allocatePlan({ allowTrimming: true });
+  assignments = sealAssignmentOpenings(assignments);
+  assignments = reduceCleanSealedAssignments(assignments);
+  assignments = rebalanceAllianceOwnership(assignments);
   enemyOpenCount = countEnemyOpenings(assignments);
+  if (enemyOpenCount && assignments.some((assignment) => assignment.flexTrim)) {
+    assignments = allocatePlan({ allowTrimming: false });
+    assignments = sealAssignmentOpenings(assignments);
+    assignments = reduceCleanSealedAssignments(assignments);
+    assignments = rebalanceAllianceOwnership(assignments);
+    enemyOpenCount = countEnemyOpenings(assignments);
+  }
   renderAllianceInputs();
   renderStats();
   renderMap();
@@ -809,25 +1486,60 @@ function renderAllianceInputs() {
 
 function renderStats() {
   const assigned = assignments.filter((assignment) => !assignment.shortfall).length;
-  const requested = state.alliances.reduce((sum, alliance) => sum + alliance.count, 0);
+  const requested = requestedTotal();
   const shortfall = Math.max(0, requested - assigned);
   const stats = [
-    ["Defender Slots", maxPlan.length.toLocaleString()],
-    ["Requested", requested.toLocaleString()],
-    ["Placed", assigned.toLocaleString()],
-    ["Enemy HQs Fit", enemyOpenCount.toLocaleString()],
-    ["Spacing", `${FIXED_SPACING} fixed`],
-    ["Seal Status", enemyOpenCount ? "Open" : "Sealed"],
+    ["defender-slots", "Defender Slots", maxPlan.length.toLocaleString()],
+    ["requested", "Requested", requested.toLocaleString()],
+    ["placed", "Placed", assigned.toLocaleString()],
+    ["enemy-hqs-fit", "Enemy HQs Fit", enemyOpenCount.toLocaleString()],
+    ["seal-status", "Seal Status", enemyOpenCount ? "Open" : "Sealed"],
+    [
+      "feedback",
+      "Feedback",
+      '<a class="feedback-link" href="mailto:lz-mudfiller@gmail.com">Email</a>',
+    ],
   ];
 
   statGrid.innerHTML = stats
-    .map(([label, value]) => `<div><dt>${label}</dt><dd>${value}</dd></div>`)
+    .map(([key, label, value]) => `<div data-stat="${key}"><dt>${label}</dt><dd>${value}</dd></div>`)
     .join("");
+}
+
+function requestedTotal() {
+  return state.alliances.reduce((sum, alliance) => sum + (Number(alliance.count) || 0), 0);
+}
+
+function requestedTotalFromForm() {
+  const rows = [...allianceList.querySelectorAll("[data-id]")];
+  if (!rows.length) return requestedTotal();
+
+  return rows.reduce((sum, row) => {
+    const countInput = row.querySelector('[data-field="count"]');
+    return sum + Math.max(0, Number(countInput?.value) || 0);
+  }, 0);
+}
+
+function renderRequestedStat() {
+  const requestedValue = statGrid.querySelector('[data-stat="requested"] dd');
+  if (requestedValue) requestedValue.textContent = requestedTotalFromForm().toLocaleString();
 }
 
 function renderMap() {
   const activeAssignments = assignments.filter((assignment) => !assignment.shortfall);
-  setMapViewBox(activeAssignments);
+  const outerSupportHqs = outerSupportPlan.length ? outerSupportPlan : buildOuterSupportHqs();
+  setMapViewBox(activeAssignments, outerSupportHqs);
+
+  const outerSupportTiles = outerSupportHqs
+    .flatMap((placement) =>
+      placement.cells.map(
+        (cell) =>
+          '<polygon class="outer-hq-cell" points="' +
+          hexPoints(cell.x, cell.y, TILE_RADIUS * 0.94) +
+          '"></polygon>',
+      ),
+    )
+    .join("");
 
   const mudTiles = buildMudTileUnderlay()
     .map((cell) => `<polygon class="mud-tile" points="${hexPoints(cell.x, cell.y, TILE_RADIUS * 0.94)}"></polygon>`)
@@ -848,6 +1560,21 @@ function renderMap() {
     )
     .join("");
 
+  const labels = activeAssignments
+    .map((assignment) => {
+      const labelCenter = projectCoordinate(assignment.anchor);
+      return `
+        <text
+          class="hq-label"
+          x="${labelCenter.x.toFixed(2)}"
+          y="${labelCenter.y.toFixed(2)}"
+          text-anchor="middle"
+          dominant-baseline="central"
+        >${assignment.number}</text>
+      `;
+    })
+    .join("");
+
   const forbiddenTiles = [...forbiddenSet]
     .map((key) => {
       const [x, y] = key.split(",").map(Number);
@@ -858,11 +1585,13 @@ function renderMap() {
   const capitalCenter = projectCoordinate(MAP_CENTER);
 
   mudLayer.innerHTML = `
+    ${outerSupportTiles}
     <polygon class="mud-area" points="${polygonText(OUTER_MUD)}"></polygon>
     ${mudTiles}
     <polygon class="blocked-area" points="${polygonText(BLOCKED_CAPITAL)}"></polygon>
     ${forbiddenTiles}
     ${tiles}
+    ${labels}
     <circle class="capital-dot" cx="${capitalCenter.x.toFixed(2)}" cy="${capitalCenter.y.toFixed(2)}" r="${(TILE_RADIUS * 1.28).toFixed(2)}"></circle>
   `;
 }
@@ -878,9 +1607,40 @@ function buildMudTileUnderlay() {
   return cells;
 }
 
-function setMapViewBox(activeAssignments = []) {
+function buildOuterSupportHqs() {
+  const bounds = coordinateBounds(OUTER_MUD, CANDIDATE_PADDING + 4);
+  const candidates = [];
+
+  for (let y = bounds.minY; y <= bounds.maxY; y += 1) {
+    for (let x = bounds.minX; x <= bounds.maxX; x += 1) {
+      const candidate = buildCandidate({ x, y }, FIXED_SPACING);
+      const fullyOutsideMud = candidate.cells.every((cell) => !isOuterMudCell(cell));
+      const hugsOuterMud = candidate.buffer.some(isValidMudCell);
+      if (fullyOutsideMud && hugsOuterMud && candidate.cells.every((cell) => !isBlockedCell(cell))) {
+        candidates.push(candidate);
+      }
+    }
+  }
+
+  return buildSpacedPlan(
+    candidates.sort(
+      (a, b) =>
+        a.innerDistance - b.innerDistance ||
+        laneOrderValue(a) - laneOrderValue(b) ||
+        a.anchor.y - b.anchor.y ||
+        a.anchor.x - b.anchor.x,
+    ),
+  );
+}
+
+function outerSupportCellKeys() {
+  return new Set(outerSupportPlan.flatMap((placement) => placement.cellKeys));
+}
+
+function setMapViewBox(activeAssignments = [], outerSupportHqs = []) {
   const renderedCells = [
     ...buildMudTileUnderlay(),
+    ...outerSupportHqs.flatMap((placement) => placement.cells),
     ...activeAssignments.flatMap((assignment) => assignment.cells),
   ];
   const projectedTiles = renderedCells.flatMap((cell) =>
@@ -896,18 +1656,161 @@ function setMapViewBox(activeAssignments = []) {
   const minY = Math.min(...ys) - padding;
   const width = Math.max(...xs) - Math.min(...xs) + padding * 2;
   const height = Math.max(...ys) - Math.min(...ys) + padding * 2;
-  document.querySelector("#mud-svg").setAttribute("viewBox", `${minX} ${minY} ${width} ${height}`);
+  baseMapViewBox = { x: minX, y: minY, width, height };
+  currentMapViewBox = { ...baseMapViewBox };
+  setMapViewBoxValue(currentMapViewBox);
+}
+
+function setMapViewBoxValue(viewBox) {
+  mudSvg.setAttribute("viewBox", viewBox.x + " " + viewBox.y + " " + viewBox.width + " " + viewBox.height);
+}
+
+function resetMapZoom() {
+  if (!baseMapViewBox) return;
+  currentMapViewBox = { ...baseMapViewBox };
+  setMapViewBoxValue(currentMapViewBox);
+}
+
+function clampMapViewBox(viewBox) {
+  if (!baseMapViewBox) return viewBox;
+
+  const minWidth = baseMapViewBox.width / 7;
+  const minHeight = baseMapViewBox.height / 7;
+  const width = Math.min(baseMapViewBox.width, Math.max(minWidth, viewBox.width));
+  const height = Math.min(baseMapViewBox.height, Math.max(minHeight, viewBox.height));
+  const minX = baseMapViewBox.x;
+  const minY = baseMapViewBox.y;
+  const maxX = baseMapViewBox.x + baseMapViewBox.width - width;
+  const maxY = baseMapViewBox.y + baseMapViewBox.height - height;
+
+  return {
+    x: Math.min(Math.max(viewBox.x, minX), maxX),
+    y: Math.min(Math.max(viewBox.y, minY), maxY),
+    width,
+    height,
+  };
+}
+
+function pointToSvgSpace(clientX, clientY, viewBox = currentMapViewBox) {
+  const rect = mudSvg.getBoundingClientRect();
+  return {
+    x: viewBox.x + ((clientX - rect.left) / rect.width) * viewBox.width,
+    y: viewBox.y + ((clientY - rect.top) / rect.height) * viewBox.height,
+  };
+}
+
+function pointerMidpoint(points) {
+  return {
+    x: (points[0].clientX + points[1].clientX) / 2,
+    y: (points[0].clientY + points[1].clientY) / 2,
+  };
+}
+
+function pointerDistance(points) {
+  return Math.hypot(points[0].clientX - points[1].clientX, points[0].clientY - points[1].clientY);
+}
+
+function startMapGesture(points = Array.from(mapPointers.values())) {
+  if (!currentMapViewBox) return;
+
+  if (points.length >= 2) {
+    const midpoint = pointerMidpoint(points);
+    mapGesture = {
+      type: "pinch",
+      startDistance: pointerDistance(points),
+      startViewBox: { ...currentMapViewBox },
+      startCenter: pointToSvgSpace(midpoint.x, midpoint.y),
+    };
+    return;
+  }
+
+  if (points.length === 1) {
+    mapGesture = {
+      type: "pan",
+      pointerId: points[0].pointerId,
+      startClient: { x: points[0].clientX, y: points[0].clientY },
+      startViewBox: { ...currentMapViewBox },
+    };
+  }
+}
+
+function updateMapGesture(points = Array.from(mapPointers.values())) {
+  if (!mapGesture || !currentMapViewBox) return;
+
+  if (mapGesture.type === "pinch" && points.length >= 2) {
+    const midpoint = pointerMidpoint(points);
+    const distance = pointerDistance(points) || mapGesture.startDistance;
+    const scale = mapGesture.startDistance / distance;
+    const start = mapGesture.startViewBox;
+    const nextWidth = start.width * scale;
+    const nextHeight = start.height * scale;
+    const anchorRatioX = (mapGesture.startCenter.x - start.x) / start.width;
+    const anchorRatioY = (mapGesture.startCenter.y - start.y) / start.height;
+    const liveCenter = pointToSvgSpace(midpoint.x, midpoint.y, start);
+
+    currentMapViewBox = clampMapViewBox({
+      x: liveCenter.x - nextWidth * anchorRatioX,
+      y: liveCenter.y - nextHeight * anchorRatioY,
+      width: nextWidth,
+      height: nextHeight,
+    });
+    setMapViewBoxValue(currentMapViewBox);
+    return;
+  }
+
+  if (mapGesture.type === "pan" && points.length === 1) {
+    const point = points.find((item) => item.pointerId === mapGesture.pointerId) || points[0];
+    const rect = mudSvg.getBoundingClientRect();
+    const deltaX = ((point.clientX - mapGesture.startClient.x) / rect.width) * mapGesture.startViewBox.width;
+    const deltaY = ((point.clientY - mapGesture.startClient.y) / rect.height) * mapGesture.startViewBox.height;
+
+    currentMapViewBox = clampMapViewBox({
+      ...mapGesture.startViewBox,
+      x: mapGesture.startViewBox.x - deltaX,
+      y: mapGesture.startViewBox.y - deltaY,
+    });
+    setMapViewBoxValue(currentMapViewBox);
+  }
+}
+
+function zoomMapAt(clientX, clientY, scale) {
+  if (!currentMapViewBox) return;
+  const start = currentMapViewBox;
+  const anchor = pointToSvgSpace(clientX, clientY, start);
+  const nextWidth = start.width * scale;
+  const nextHeight = start.height * scale;
+  const anchorRatioX = (anchor.x - start.x) / start.width;
+  const anchorRatioY = (anchor.y - start.y) / start.height;
+
+  currentMapViewBox = clampMapViewBox({
+    x: anchor.x - nextWidth * anchorRatioX,
+    y: anchor.y - nextHeight * anchorRatioY,
+    width: nextWidth,
+    height: nextHeight,
+  });
+  setMapViewBoxValue(currentMapViewBox);
+}
+
+function touchPoints(event) {
+  return Array.from(event.touches).map((touch) => ({
+    pointerId: touch.identifier,
+    clientX: touch.clientX,
+    clientY: touch.clientY,
+  }));
 }
 
 function renderLegend() {
   legend.innerHTML = state.alliances
     .map((alliance, index) => {
       const activeCount = assignments.filter((assignment) => !assignment.shortfall && assignment.alliance.id === alliance.id).length;
+      const requestedCount = Number(alliance.count) || 0;
+      const allianceName = alliance.name || `Alliance ${index + 1}`;
       return `
         <span class="legend-item" data-alliance-id="${escapeHtml(alliance.id)}">
           <i style="--swatch:${ALLIANCE_COLORS[index % ALLIANCE_COLORS.length]}"></i>
-          <span>${escapeHtml(alliance.name || `Alliance ${index + 1}`)}</span>
-          <button class="icon-button alliance-copy" type="button" title="Copy alliance coordinates" aria-label="Copy ${escapeHtml(alliance.name || `Alliance ${index + 1}`)} coordinates" ${activeCount ? "" : "disabled"}>
+          <span class="legend-name">${escapeHtml(allianceName)}</span>
+          <span class="legend-count">${requestedCount}/${activeCount}</span>
+          <button class="icon-button alliance-copy" type="button" title="Copy alliance coordinates" aria-label="Copy ${escapeHtml(allianceName)} coordinates" ${activeCount ? "" : "disabled"}>
             <svg aria-hidden="true" viewBox="0 0 24 24">
               <path d="M8 8h10v12H8z"></path>
               <path d="M6 16H4V4h12v2"></path>
@@ -919,9 +1822,21 @@ function renderLegend() {
     .join("");
 }
 
+function formatShortfallWarning(shortfall) {
+  const qualityTrim = Math.min(shortfall, assignments.filter((assignment) => assignment.shortfall && assignment.flexTrim).length);
+  const hqLabel = (count) => (count === 1 ? "requested HQ" : "requested HQs");
+
+  if (qualityTrim) {
+    const verb = qualityTrim === 1 ? "was" : "were";
+    const additional = shortfall > qualityTrim ? ` ${shortfall - qualityTrim} additional ${hqLabel(shortfall - qualityTrim)} could not fit.` : "";
+    return `${qualityTrim} ${hqLabel(qualityTrim)} ${verb} left unplaced within the -${ALLIANCE_TRIM_FLEX}/+${ALLIANCE_EXTRA_FLEX} alliance flexibility range to keep lanes cleaner.${additional}`;
+  }
+
+  return `${shortfall} ${hqLabel(shortfall)} could not fit in the current mud shape.`;
+}
 function renderAssignmentTable() {
   const activeAssignments = assignments.filter((assignment) => !assignment.shortfall);
-  const shortfall = assignments.filter((assignment) => assignment.shortfall).length;
+  const shortfall = Math.max(0, requestedTotal() - activeAssignments.length);
   const openDefenseSlots = countOpenDefenseSlots(assignments);
   const enemyWarning = formatEnemyWarning(openDefenseSlots);
 
@@ -930,38 +1845,41 @@ function renderAssignmentTable() {
     return;
   }
 
+  const rows = activeAssignments
+    .map((assignment, index) => {
+      const coordinate = formatEmptyLand(assignment.anchor);
+      const allianceLabel = `${assignment.alliance.name || `Alliance ${assignment.allianceIndex + 1}`} ${assignment.number}`;
+      const copyLine = formatAssignmentCopyLine(assignment);
+      return `
+        <article class="table-row">
+          <span>${index + 1}</span>
+          <strong>${escapeHtml(allianceLabel)}</strong>
+          <input class="assignment-name-input" data-name-key="${escapeHtml(assignmentNameKey(assignment))}" maxlength="40" value="${escapeHtml(getAssignmentName(assignment))}" placeholder="Name" />
+          <span>${escapeHtml(coordinate)}</span>
+          <button class="icon-button row-copy" type="button" data-copy-text="${escapeHtml(copyLine)}" title="Copy coordinate" aria-label="Copy coordinate">
+            <svg aria-hidden="true" viewBox="0 0 24 24">
+              <path d="M8 8h10v12H8z"></path>
+              <path d="M6 16H4V4h12v2"></path>
+            </svg>
+          </button>
+        </article>
+      `;
+    })
+    .join("");
+
   assignmentTable.innerHTML = `
-    ${shortfall ? `<div class="warning">${shortfall} requested HQs could not fit in the current mud shape.</div>` : ""}
+    ${shortfall ? `<div class="warning">${formatShortfallWarning(shortfall)}</div>` : ""}
     ${hasTrueEnemyOpenings() ? `<div class="warning">${enemyWarning}</div>` : ""}
     <div class="table-head">
       <span>#</span>
       <span>Alliance</span>
+      <span>Name</span>
       <span>Coordinates</span>
       <span>Copy</span>
     </div>
-    ${activeAssignments
-      .map(
-        (assignment, index) => {
-          const coordinate = formatEmptyLand(assignment.anchor);
-          return `
-          <article class="table-row">
-            <span>${index + 1}</span>
-            <strong>${escapeHtml(assignment.alliance.name || `Alliance ${assignment.allianceIndex + 1}`)} ${assignment.number}</strong>
-            <span>${escapeHtml(coordinate)}</span>
-            <button class="icon-button row-copy" type="button" data-coordinate="${escapeHtml(coordinate)}" title="Copy coordinate" aria-label="Copy coordinate">
-              <svg aria-hidden="true" viewBox="0 0 24 24">
-                <path d="M8 8h10v12H8z"></path>
-                <path d="M6 16H4V4h12v2"></path>
-              </svg>
-            </button>
-          </article>
-        `;
-        },
-      )
-      .join("")}
+    ${rows}
   `;
 }
-
 function hexPoints(x, y, radius) {
   return hexPointList(x, y, radius).join(" ");
 }
@@ -981,22 +1899,36 @@ function projectCoordinate(point) {
   };
 }
 
+function assignmentNameKey(assignment) {
+  return `${assignment.alliance.id}:${assignment.number}`;
+}
+
+function getAssignmentName(assignment) {
+  return state.hqNames?.[assignmentNameKey(assignment)] || "";
+}
+
+function formattedAssignmentLabel(assignment) {
+  const allianceName = assignment.alliance.name || `Alliance ${assignment.allianceIndex + 1}`;
+  return `${allianceName} HQ ${assignment.number}`;
+}
+
+function assignmentCopyName(assignment) {
+  return getAssignmentName(assignment).trim();
+}
+
+function formatAssignmentCopyLine(assignment, index = null) {
+  const prefix = index === null ? "" : `${index + 1}, `;
+  return `${prefix}${formattedAssignmentLabel(assignment)}, ${assignmentCopyName(assignment)}, ${formatEmptyLand(assignment.anchor)}`;
+}
+
 function buildCoordinateText(compact = false) {
   const activeAssignments = assignments.filter((assignment) => !assignment.shortfall);
   const serverText = state.server ? `Server ${state.server}` : "Server";
   const title = compact ? `${serverText} Mud Filler` : `${serverText} Mud Filler Coordinates`;
-
-  const rows = activeAssignments.map((assignment, index) => {
-    const allianceName = assignment.alliance.name || `Alliance ${assignment.allianceIndex + 1}`;
-    const coordinate = formatEmptyLand(assignment.anchor);
-    return compact
-      ? `${index + 1}. ${allianceName} HQ ${assignment.number}: ${coordinate}`
-      : `${index + 1}\t${allianceName} HQ ${assignment.number}\t${coordinate}`;
-  });
+  const rows = activeAssignments.map((assignment, index) => formatAssignmentCopyLine(assignment, index));
 
   return [title, ...rows].join("\n");
 }
-
 function buildAllianceCoordinateText(allianceId) {
   const activeAssignments = assignments.filter(
     (assignment) => !assignment.shortfall && assignment.alliance.id === allianceId,
@@ -1006,30 +1938,273 @@ function buildAllianceCoordinateText(allianceId) {
   const firstAssignment = activeAssignments[0];
   const allianceName = firstAssignment.alliance.name || `Alliance ${firstAssignment.allianceIndex + 1}`;
   const serverText = state.server ? `Server ${state.server}` : "Server";
-  const rows = activeAssignments.map(
-    (assignment) => `${allianceName} HQ ${assignment.number}: ${formatEmptyLand(assignment.anchor)}`,
-  );
+  const rows = activeAssignments.map((assignment) => formatAssignmentCopyLine(assignment));
 
   return [`${serverText} Mud Filler - ${allianceName}`, ...rows].join("\n");
 }
+function triggerDownload(filename, href) {
+  const link = document.createElement("a");
+  link.href = href;
+  link.download = filename;
+  link.rel = "noopener";
+  link.style.display = "none";
+  document.body.append(link);
+  link.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+  link.remove();
+}
 
+function downloadBlobFile(filename, content, type) {
+  const blob = content instanceof Blob ? content : new Blob([content], { type: type || "application/octet-stream" });
+  if (!blob.size) return "";
+
+  const href = URL.createObjectURL(blob);
+  setTimeout(() => triggerDownload(filename, href), 0);
+  return href;
+}
+
+function showDownloadFallback(filename, href, label, previewText = "") {
+  if (!downloadFallback || !href) return;
+  if (downloadFallbackUrl && downloadFallbackUrl !== href) URL.revokeObjectURL(downloadFallbackUrl);
+  downloadFallbackUrl = href;
+
+  const message = document.createElement("p");
+  message.textContent = "If the file does not appear in Downloads, use this direct file link.";
+
+  const link = document.createElement("a");
+  link.href = href;
+  link.download = filename;
+  link.target = "_blank";
+  link.rel = "noopener";
+  link.textContent = label;
+
+  downloadFallback.replaceChildren(message, link);
+
+  if (previewText) {
+    const preview = document.createElement("textarea");
+    preview.readOnly = true;
+    preview.value = previewText;
+    preview.setAttribute("aria-label", "Configuration file preview");
+    downloadFallback.append(preview);
+  }
+
+  downloadFallback.hidden = false;
+}
+
+function fileSafeName(value) {
+  return String(value || "lastz")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "") || "lastz";
+}
+
+function buildConfiguration() {
+  return {
+    app: "Last Z Mud Filler",
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    state: {
+      server: state.server,
+      alliances: state.alliances.map((alliance) => ({
+        id: alliance.id,
+        name: alliance.name,
+        count: Number(alliance.count) || 0,
+      })),
+      hqNames: { ...(state.hqNames || {}) },
+    },
+  };
+}
+
+function downloadConfiguration() {
+  syncStateFromForm();
+  saveState();
+  const filename = `lastz-mud-filler-${fileSafeName(state.server || "server")}.json`;
+  const content = JSON.stringify(buildConfiguration(), null, 2);
+  const href = downloadBlobFile(filename, content, "application/json");
+  if (href) {
+    showDownloadFallback(filename, href, "Open configuration file", content);
+    showToast("Configuration download started");
+  } else {
+    showToast("Could not create configuration file");
+  }
+}
+
+function normalizeImportedConfiguration(payload) {
+  const importedState = payload?.state || payload;
+  if (!importedState || !Array.isArray(importedState.alliances)) {
+    throw new Error("Invalid Last Z Mud Filler configuration file");
+  }
+
+  return {
+    server: importedState.server ? String(importedState.server) : "",
+    spacing: FIXED_SPACING,
+    alliances: importedState.alliances.length
+      ? importedState.alliances.map((alliance) => ({
+          id: alliance.id || makeId(),
+          name: alliance.name ? String(alliance.name) : "",
+          count: Math.max(0, Number(alliance.count) || 0),
+        }))
+      : structuredClone(defaultState.alliances),
+    hqNames: importedState.hqNames && typeof importedState.hqNames === "object" ? importedState.hqNames : {},
+  };
+}
+
+async function importConfigurationFile(file) {
+  try {
+    const text = await file.text();
+    state = normalizeImportedConfiguration(JSON.parse(text));
+    cleanAllianceRows();
+    renderAll();
+    showToast("Configuration loaded");
+  } catch (error) {
+    showToast(error.message || "Could not load configuration");
+  }
+}
+
+function mapExportStyles() {
+  return `
+    .mud-area{fill:rgba(111,73,43,.78);stroke:#f2b84b;stroke-width:.75}
+    .mud-tile{fill:rgba(154,102,68,.16);stroke:rgba(242,184,75,.2);stroke-width:.055}
+    .blocked-area{fill:rgba(18,22,17,.86);stroke:rgba(239,106,87,.86);stroke-dasharray:1.2 1;stroke-width:.62}
+    .forbidden-cell{fill:rgba(239,106,87,.8);stroke:rgba(10,12,9,.85);stroke-width:.1}
+    .outer-hq-cell{fill:rgba(128,136,126,.62);stroke:rgba(10,12,9,.78);stroke-width:.1}
+    .hq-cell{opacity:.92;stroke:rgba(10,12,9,.9);stroke-width:.11}
+    .capital-dot{fill:#ef6a57;stroke:#fff1d6;stroke-width:.35}
+    .hq-label{fill:#091006;stroke:rgba(255,255,255,.42);stroke-width:.065;paint-order:stroke;font:950 1.42px system-ui,sans-serif;pointer-events:none}
+  `;
+}
+
+async function downloadMapJpg() {
+  try {
+    const clone = mudSvg.cloneNode(true);
+    clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+    if (baseMapViewBox) {
+      clone.setAttribute("viewBox", `${baseMapViewBox.x} ${baseMapViewBox.y} ${baseMapViewBox.width} ${baseMapViewBox.height}`);
+    }
+    clone.querySelector("defs")?.insertAdjacentHTML("afterbegin", `<style>${mapExportStyles()}</style>`);
+
+    const viewBox = baseMapViewBox || currentMapViewBox || { width: 80, height: 70 };
+    const width = 1800;
+    const height = Math.max(1200, Math.round(width * (viewBox.height / viewBox.width)));
+    clone.setAttribute("width", width);
+    clone.setAttribute("height", height);
+
+    const svgText = new XMLSerializer().serializeToString(clone);
+    const svgBlob = new Blob([svgText], { type: "image/svg+xml;charset=utf-8" });
+    const url = URL.createObjectURL(svgBlob);
+    const image = new Image();
+
+    await new Promise((resolve, reject) => {
+      image.onload = resolve;
+      image.onerror = reject;
+      image.src = url;
+    });
+
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext("2d");
+    context.fillStyle = "#0e120d";
+    context.fillRect(0, 0, width, height);
+    context.drawImage(image, 0, 0, width, height);
+    URL.revokeObjectURL(url);
+
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.92));
+    if (!blob || !blob.size) {
+      showToast("Could not create map image");
+      return;
+    }
+
+    const filename = `lastz-fill-map-${fileSafeName(state.server || "server")}.jpg`;
+    const href = downloadBlobFile(filename, blob, "image/jpeg");
+    if (!href) {
+      showToast("Could not create map image");
+      return;
+    }
+    showDownloadFallback(filename, href, "Open map JPG");
+    showToast("Map JPG download started");
+  } catch {
+    showToast("Could not create map image");
+  }
+}
 function formatEmptyLand(point) {
   const server = state.server || "SVR";
   return `Empty Land [#:${server} X:${point.x} Y:${point.y}]`;
 }
 
-async function copyText(text, message) {
-  try {
-    await navigator.clipboard.writeText(text);
-  } catch {
-    const temp = document.createElement("textarea");
-    temp.value = text;
-    document.body.append(temp);
-    temp.select();
-    document.execCommand("copy");
-    temp.remove();
+function copyText(text, message = "") {
+  const value = String(text || "");
+  if (!value) {
+    showToast("Nothing to copy");
+    return;
   }
-  showToast(message);
+
+  const selectionCopied = copyTextWithSelection(value);
+  const clipboardWrite = writeClipboard(value);
+
+  if (selectionCopied) {
+    if (message) showToast(message);
+    return;
+  }
+
+  clipboardWrite.then((copied) => {
+    if (copied) {
+      if (message) showToast(message);
+    } else {
+      showToast("Copy failed. Select and copy manually.");
+    }
+  });
+}
+
+async function writeClipboard(text) {
+  try {
+    if (!navigator.clipboard?.writeText) return false;
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function copyTextWithSelection(text) {
+  const temp = document.createElement("textarea");
+  temp.value = text;
+  temp.setAttribute("readonly", "");
+  temp.style.position = "fixed";
+  temp.style.left = "0";
+  temp.style.top = "0";
+  temp.style.width = "1px";
+  temp.style.height = "1px";
+  temp.style.opacity = "0";
+  temp.style.pointerEvents = "none";
+  document.body.append(temp);
+
+  let copyEventFired = false;
+  const handleCopy = (event) => {
+    event.clipboardData.setData("text/plain", text);
+    event.preventDefault();
+    copyEventFired = true;
+  };
+
+  const previousFocus = document.activeElement;
+  document.addEventListener("copy", handleCopy);
+  temp.focus({ preventScroll: true });
+  temp.select();
+  temp.setSelectionRange(0, temp.value.length);
+
+  try {
+    document.execCommand("copy");
+  } catch {
+    copyEventFired = false;
+  }
+
+  document.removeEventListener("copy", handleCopy);
+  temp.remove();
+  if (previousFocus && typeof previousFocus.focus === "function") {
+    previousFocus.focus({ preventScroll: true });
+  }
+
+  return copyEventFired;
 }
 
 function showToast(message) {
@@ -1051,13 +2226,118 @@ function makeId() {
   return `alliance-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function armMapInteraction() {
+  if (mapInteractionArmed) return;
+  mapInteractionArmed = true;
+  mapFrame.classList.add("map-armed");
+  showToast("Map zoom and pan enabled");
+}
+
+function disarmMapInteraction() {
+  if (!mapInteractionArmed) return;
+  mapInteractionArmed = false;
+  mapFrame.classList.remove("map-armed");
+  mapPointers.clear();
+  mapGesture = null;
+}
+
+mapFrame.addEventListener("touchstart", (event) => {
+  if (!currentMapViewBox || !mapInteractionArmed) return;
+  usingTouchGesture = true;
+  event.preventDefault();
+  const points = touchPoints(event);
+
+  const now = Date.now();
+  if (points.length === 1 && now - lastTouchTap < 300) {
+    resetMapZoom();
+    lastTouchTap = 0;
+    return;
+  }
+  if (points.length === 1) lastTouchTap = now;
+  startMapGesture(points);
+}, { passive: false });
+
+mapFrame.addEventListener("touchmove", (event) => {
+  if (!currentMapViewBox || !mapInteractionArmed) return;
+  event.preventDefault();
+  updateMapGesture(touchPoints(event));
+}, { passive: false });
+
+mapFrame.addEventListener("touchend", (event) => {
+  if (!mapInteractionArmed) return;
+  event.preventDefault();
+  const points = touchPoints(event);
+  mapGesture = null;
+  if (points.length) {
+    startMapGesture(points);
+  } else {
+    setTimeout(() => {
+      usingTouchGesture = false;
+    }, 80);
+  }
+}, { passive: false });
+
+mapFrame.addEventListener("touchcancel", (event) => {
+  if (!mapInteractionArmed) return;
+  event.preventDefault();
+  mapGesture = null;
+  usingTouchGesture = false;
+}, { passive: false });
+
+mapFrame.addEventListener("wheel", (event) => {
+  if (!currentMapViewBox || !mapInteractionArmed) return;
+  event.preventDefault();
+  zoomMapAt(event.clientX, event.clientY, Math.exp(event.deltaY * 0.001));
+}, { passive: false });
+
+mudSvg.addEventListener("click", () => {
+  if (!currentMapViewBox || mapInteractionArmed) return;
+  armMapInteraction();
+});
+
+mudSvg.addEventListener("pointerdown", (event) => {
+  if (event.pointerType === "touch") return;
+  if (!currentMapViewBox || usingTouchGesture || !mapInteractionArmed) return;
+  event.preventDefault();
+  mudSvg.setPointerCapture(event.pointerId);
+  mapPointers.set(event.pointerId, event);
+
+  const now = Date.now();
+  if (mapPointers.size === 1 && now - lastMapTap < 300) {
+    resetMapZoom();
+    lastMapTap = 0;
+    return;
+  }
+  lastMapTap = now;
+  startMapGesture();
+});
+
+mudSvg.addEventListener("pointermove", (event) => {
+  if (usingTouchGesture || !mapPointers.has(event.pointerId)) return;
+  event.preventDefault();
+  mapPointers.set(event.pointerId, event);
+  updateMapGesture();
+});
+
+["pointerup", "pointercancel", "pointerleave"].forEach((eventName) => {
+  mudSvg.addEventListener(eventName, (event) => {
+    if (usingTouchGesture || !mapPointers.has(event.pointerId)) return;
+    mapPointers.delete(event.pointerId);
+    if (mudSvg.hasPointerCapture(event.pointerId)) {
+      mudSvg.releasePointerCapture(event.pointerId);
+    }
+    mapGesture = null;
+    if (mapPointers.size) startMapGesture();
+  });
+});
+
 serverNumber.addEventListener("input", () => {
   state.server = serverNumber.value.trim();
   if (state.server) serverNumber.classList.remove("input-error");
   saveState();
 });
 
-allianceList.addEventListener("input", (event) => {
+function handleAllianceDraftChange(event) {
   const row = event.target.closest("[data-id]");
   const field = event.target.dataset.field;
   if (!row || !field) return;
@@ -1066,8 +2346,12 @@ allianceList.addEventListener("input", (event) => {
   if (!alliance) return;
 
   alliance[field] = field === "count" ? Math.max(0, Number(event.target.value) || 0) : event.target.value;
+  renderRequestedStat();
   saveState();
-});
+}
+
+allianceList.addEventListener("input", handleAllianceDraftChange);
+allianceList.addEventListener("change", handleAllianceDraftChange);
 
 allianceList.addEventListener("click", (event) => {
   const removeButton = event.target.closest(".remove-alliance");
@@ -1076,12 +2360,14 @@ allianceList.addEventListener("click", (event) => {
   const row = removeButton.closest("[data-id]");
   state.alliances = state.alliances.filter((alliance) => alliance.id !== row.dataset.id);
   renderAllianceInputs();
+  renderRequestedStat();
   saveState();
 });
 
 document.querySelector("#add-alliance").addEventListener("click", () => {
   state.alliances.push({ id: makeId(), name: "", count: 1 });
   renderAllianceInputs();
+  renderRequestedStat();
   saveState();
   allianceList.querySelector(".alliance-row:last-child input")?.focus();
 });
@@ -1100,10 +2386,21 @@ document.querySelector("#generate-plan").addEventListener("click", () => {
   showToast("Fill map generated");
 });
 
+assignmentTable.addEventListener("input", (event) => {
+  const input = event.target.closest(".assignment-name-input");
+  if (!input) return;
+  state.hqNames = state.hqNames || {};
+  if (input.value.trim()) {
+    state.hqNames[input.dataset.nameKey] = input.value;
+  } else {
+    delete state.hqNames[input.dataset.nameKey];
+  }
+  saveState();
+});
 assignmentTable.addEventListener("click", (event) => {
   const copyButton = event.target.closest(".row-copy");
   if (!copyButton) return;
-  copyText(copyButton.dataset.coordinate, "Coordinate copied");
+  copyText(copyButton.dataset.copyText, "Coordinate copied");
 });
 
 legend.addEventListener("click", (event) => {
@@ -1122,7 +2419,29 @@ document.querySelector("#copy-coords").addEventListener("click", () => {
 });
 
 document.querySelector("#copy-discord").addEventListener("click", () => {
-  copyText(buildCoordinateText(true), "Message copied");
+  copyText(buildCoordinateText(true));
+});
+
+document.querySelector("#download-map").addEventListener("click", () => {
+  downloadMapJpg();
+});
+
+document.querySelector("#download-config").addEventListener("click", () => {
+  downloadConfiguration();
+});
+
+document.querySelector("#upload-config").addEventListener("click", () => {
+  configFileInput.click();
+});
+
+configFileInput.addEventListener("change", () => {
+  const [file] = configFileInput.files || [];
+  if (file) importConfigurationFile(file);
+  configFileInput.value = "";
+});
+
+document.addEventListener("pointerdown", (event) => {
+  if (!mapFrame.contains(event.target)) disarmMapInteraction();
 });
 
 document.querySelector("#reset-button").addEventListener("click", () => {

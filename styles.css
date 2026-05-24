@@ -335,20 +335,92 @@ button svg {
   font-weight: 950;
 }
 
+.feedback-link {
+  color: var(--acid);
+  text-decoration: none;
+}
+
+.feedback-link:hover,
+.feedback-link:focus-visible {
+  color: var(--text);
+  text-decoration: underline;
+}
+
 .map-tools {
   display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 8px;
 }
 
 .map-frame {
+  position: relative;
   padding: 12px;
+  overflow: hidden;
+  touch-action: pan-y;
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 #mud-svg {
+  display: block;
   width: 100%;
   min-height: 560px;
   border: 1px solid #2f382a;
   background: #0e120d;
+  cursor: pointer;
+  touch-action: pan-y;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.map-frame.map-armed #mud-svg {
+  border-color: rgba(182, 240, 85, .72);
+  cursor: grab;
+  touch-action: none;
+}
+
+.map-frame.map-armed #mud-svg:active {
+  cursor: grabbing;
+}
+
+.download-fallback {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid var(--line-bright);
+  background: #141812;
+}
+
+.download-fallback[hidden] {
+  display: none;
+}
+
+.download-fallback p {
+  margin: 0;
+  color: var(--muted);
+  font-size: .86rem;
+  font-weight: 800;
+}
+
+.download-fallback a {
+  width: fit-content;
+  color: var(--acid);
+  font-weight: 950;
+  text-decoration: none;
+}
+
+.download-fallback a:hover,
+.download-fallback a:focus-visible {
+  color: var(--text);
+  text-decoration: underline;
+}
+
+.download-fallback textarea {
+  min-height: 120px;
+  resize: vertical;
+  font: 800 .78rem/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 }
 
 .mud-area {
@@ -376,6 +448,12 @@ button svg {
   stroke-width: .1;
 }
 
+.outer-hq-cell {
+  fill: rgba(128, 136, 126, .62);
+  stroke: rgba(10, 12, 9, .78);
+  stroke-width: .1;
+}
+
 .hq-cell {
   opacity: .92;
   stroke: rgba(10, 12, 9, .9);
@@ -391,7 +469,10 @@ button svg {
 
 .hq-label {
   fill: #091006;
-  font-size: 1.55px;
+  stroke: rgba(255, 255, 255, .42);
+  stroke-width: .065;
+  paint-order: stroke;
+  font-size: 1.42px;
   font-weight: 950;
   pointer-events: none;
 }
@@ -400,7 +481,7 @@ button svg {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
-  padding: 0 12px 12px;
+  padding: 12px 12px 0;
 }
 
 .legend-item {
@@ -416,8 +497,14 @@ button svg {
   font-weight: 850;
 }
 
-.legend-item span {
+.legend-name {
   min-width: 0;
+}
+
+.legend-count {
+  color: var(--muted);
+  font-size: .76rem;
+  font-weight: 950;
 }
 
 .legend-item i {
@@ -441,7 +528,7 @@ button svg {
 .table-head,
 .table-row {
   display: grid;
-  grid-template-columns: 54px minmax(150px, .7fr) minmax(260px, 1.3fr) 52px;
+  grid-template-columns: 54px minmax(130px, .55fr) minmax(150px, .65fr) minmax(260px, 1.35fr) 52px;
   gap: 10px;
   align-items: center;
 }
@@ -464,6 +551,11 @@ button svg {
 
 .table-row .row-copy {
   justify-self: start;
+}
+
+.assignment-name-input {
+  min-height: 38px;
+  padding: 8px 10px;
 }
 
 .table-row span,
