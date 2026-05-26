@@ -46,8 +46,49 @@ const EXTRA_FORBIDDEN = [
 ];
 
 const FIXED_SPACING = 1;
-const ALLIANCE_EXTRA_FLEX = 5;
-const ALLIANCE_TRIM_FLEX = 10;
+const ALLIANCE_EXTRA_FLEX = Number.POSITIVE_INFINITY;
+const ALLIANCE_TRIM_FLEX = Number.POSITIVE_INFINITY;
+const MAX_CONTACT_CLUSTER_SIZE = 2;
+const PLAN_SPACING_OPTIONS = [1];
+const KNOWN_GOOD_STANDALONE_ANCHORS = [
+  { x: 467, y: 499 },
+  { x: 468, y: 503 },
+  { x: 469, y: 495 },
+  { x: 531, y: 496 },
+  { x: 470, y: 507 },
+  { x: 530, y: 504 },
+  { x: 471, y: 491 },
+  { x: 529, y: 492 },
+  { x: 472, y: 511 },
+  { x: 473, y: 487 },
+  { x: 527, y: 488 },
+  { x: 475, y: 517 },
+  { x: 475, y: 483 },
+  { x: 524, y: 482 },
+  { x: 519, y: 529 },
+  { x: 483, y: 533 },
+  { x: 483, y: 467 },
+  { x: 478, y: 523 },
+  { x: 522, y: 478 },
+  { x: 518, y: 470 },
+  { x: 516, y: 532 },
+  { x: 487, y: 467 },
+  { x: 511, y: 467 },
+  { x: 485, y: 529 },
+  { x: 485, y: 471 },
+  { x: 491, y: 533 },
+  { x: 491, y: 467 },
+  { x: 507, y: 467 },
+  { x: 485, y: 525 },
+];
+const STRATEGIC_GROUP_STARTS = [
+  { x: 486, y: 486 },
+  { x: 524, y: 512 },
+  { x: 496, y: 532 },
+  { x: 515, y: 525 },
+  { x: 512, y: 475 },
+  { x: 476, y: 502 },
+];
 const CANDIDATE_PADDING = 3;
 const MAP_CENTER = { x: 500, y: 500 };
 const TILE_RADIUS = 0.58;
@@ -70,6 +111,8 @@ const ALLIANCE_COLORS = [
 const storageKey = "last-z-mudfiller-v2";
 const forbiddenSet = new Set(EXTRA_FORBIDDEN.map(([x, y]) => pointKey({ x, y })));
 const outerMudCellCache = new Map();
+const placementContactKeyCache = new Map();
+const favorableScoreCache = new Map();
 const defaultState = {
   server: "",
   spacing: FIXED_SPACING,
@@ -81,6 +124,7 @@ const defaultState = {
 };
 
 let state = loadState();
+let generationSeed = 1;
 let enemyCandidateCount = 0;
 let enemyOpenCount = 0;
 let outerSupportPlan = [];
@@ -94,6 +138,7 @@ let lastMapTap = 0;
 let lastTouchTap = 0;
 let usingTouchGesture = false;
 let mapInteractionArmed = false;
+let showEnemyPlacements = false;
 
 const allianceList = document.querySelector("#alliance-list");
 const statGrid = document.querySelector("#stat-grid");
@@ -107,7 +152,21 @@ const toast = document.querySelector("#toast");
 const capitalImage = document.querySelector("#capital-image");
 const configFileInput = document.querySelector("#config-file");
 const downloadFallback = document.querySelector("#download-fallback");
+const optimizeFurtherButton = document.querySelector("#optimize-further");
+const optimizeLabel = document.querySelector("#optimize-label");
 let downloadFallbackUrl = "";
+
+function setOptimizeButtonText(text) {
+  const liveLabel = document.querySelector("#optimize-label");
+  if (liveLabel) {
+    liveLabel.textContent = text;
+    return;
+  }
+
+  if (optimizeFurtherButton) {
+    optimizeFurtherButton.textContent = text;
+  }
+}
 
 capitalImage.addEventListener("error", () => {
   capitalImage.hidden = true;
@@ -327,6 +386,199 @@ function hexDistance(start, end) {
   ) / 2;
 }
 
+function hexNeighbors(point) {
+  const neighbors = [];
+
+  for (let dy = -1; dy <= 1; dy += 1) {
+    for (let dx = -1; dx <= 1; dx += 1) {
+      if (dx === 0 && dy === 0) continue;
+      const neighbor = { x: point.x + dx, y: point.y + dy };
+      if (hexDistance(point, neighbor) === 1) neighbors.push(neighbor);
+    }
+  }
+
+  return neighbors;
+}
+
+function placementContactKeys(placement) {
+  if (placementContactKeyCache.has(placement.id)) return placementContactKeyCache.get(placement.id);
+
+  const ownCells = new Set(placement.cellKeys || placement.cells.map(pointKey));
+  const contactKeys = new Set();
+
+  placement.cells.forEach((cell) => {
+    hexNeighbors(cell).forEach((neighbor) => {
+      const key = pointKey(neighbor);
+      if (!ownCells.has(key)) contactKeys.add(key);
+    });
+  });
+
+  placementContactKeyCache.set(placement.id, contactKeys);
+  return contactKeys;
+}
+
+function placementsShareEdge(a, b) {
+  const contactKeys = placementContactKeys(a);
+  return b.cellKeys.some((key) => contactKeys.has(key));
+}
+
+function placementCellIndex(placements) {
+  const index = new Map();
+
+  placements.forEach((placement) => {
+    placement.cellKeys.forEach((key) => index.set(key, placement));
+  });
+
+  return index;
+}
+
+function overlappingPlacements(candidate, placements, cellIndex = placementCellIndex(placements)) {
+  const overlaps = new Map();
+
+  candidate.cellKeys.forEach((key) => {
+    const placement = cellIndex.get(key);
+    if (placement) overlaps.set(placement.id, placement);
+  });
+
+  return [...overlaps.values()];
+}
+
+function touchedPlacements(candidate, placements, cellIndex = placementCellIndex(placements)) {
+  const candidateContactKeys = placementContactKeys(candidate);
+  const touched = new Map();
+
+  candidateContactKeys.forEach((key) => {
+    const placement = cellIndex.get(key);
+    if (placement) touched.set(placement.id, placement);
+  });
+
+  return [...touched.values()];
+}
+
+function contactCountsForPlacements(placements) {
+  const counts = new Map(placements.map((placement) => [placement.id, 0]));
+
+  placements.forEach((placement, index) => {
+    for (let otherIndex = index + 1; otherIndex < placements.length; otherIndex += 1) {
+      const other = placements[otherIndex];
+      if (!placementsShareEdge(placement, other)) continue;
+      counts.set(placement.id, (counts.get(placement.id) || 0) + 1);
+      counts.set(other.id, (counts.get(other.id) || 0) + 1);
+    }
+  });
+
+  return counts;
+}
+
+function wouldExceedContactCluster(
+  candidate,
+  placements,
+  maxClusterSize = MAX_CONTACT_CLUSTER_SIZE,
+  contactCounts = contactCountsForPlacements(placements),
+  cellIndex = placementCellIndex(placements),
+) {
+  const touched = touchedPlacements(candidate, placements, cellIndex);
+  if (!touched.length) return false;
+  if (maxClusterSize <= 1) return true;
+
+  if (touched.length >= maxClusterSize) return true;
+  return touched.some((placement) => (contactCounts.get(placement.id) || 0) > 0);
+}
+
+function contactClusterStats(placements, maxClusterSize = MAX_CONTACT_CLUSTER_SIZE) {
+  const visited = new Set();
+  let largest = 0;
+  let excess = 0;
+
+  placements.forEach((placement) => {
+    if (visited.has(placement.id)) return;
+
+    const queue = [placement];
+    visited.add(placement.id);
+    let size = 0;
+
+    while (queue.length) {
+      const current = queue.shift();
+      size += 1;
+
+      placements.forEach((other) => {
+        if (visited.has(other.id) || !placementsShareEdge(current, other)) return;
+        visited.add(other.id);
+        queue.push(other);
+      });
+    }
+
+    largest = Math.max(largest, size);
+    excess += Math.max(0, size - maxClusterSize);
+  });
+
+  return { largest, excess };
+}
+
+function contactClusters(placements) {
+  const visited = new Set();
+  const clusters = [];
+
+  placements.forEach((placement) => {
+    if (visited.has(placement.id)) return;
+
+    const queue = [placement];
+    const members = [];
+    visited.add(placement.id);
+
+    while (queue.length) {
+      const current = queue.shift();
+      members.push(current);
+
+      placements.forEach((other) => {
+        if (visited.has(other.id) || !placementsShareEdge(current, other)) return;
+        visited.add(other.id);
+        queue.push(other);
+      });
+    }
+
+    if (members.length > 1) {
+      clusters.push({
+        members,
+        edgeCount: contactEdgeCount(members),
+        center: averageAnchor(members),
+      });
+    }
+  });
+
+  return clusters.sort(
+    (a, b) =>
+      b.edgeCount - a.edgeCount ||
+      b.members.length - a.members.length ||
+      a.center.y - b.center.y ||
+      a.center.x - b.center.x,
+  );
+}
+
+function averageAnchor(placements) {
+  if (!placements.length) return MAP_CENTER;
+  const total = placements.reduce(
+    (sum, placement) => ({ x: sum.x + placement.anchor.x, y: sum.y + placement.anchor.y }),
+    { x: 0, y: 0 },
+  );
+  return {
+    x: total.x / placements.length,
+    y: total.y / placements.length,
+  };
+}
+
+function contactEdgeCount(placements) {
+  let count = 0;
+
+  placements.forEach((placement, index) => {
+    for (let otherIndex = index + 1; otherIndex < placements.length; otherIndex += 1) {
+      if (placementsShareEdge(placement, placements[otherIndex])) count += 1;
+    }
+  });
+
+  return count;
+}
+
 function offsetToAxial(point) {
   return {
     q: point.x - (point.y - Math.abs(point.y % 2)) / 2,
@@ -357,32 +609,55 @@ function coordinateBounds(points, padding = 0) {
 
 function buildMaxPlan() {
   outerSupportPlan = buildOuterSupportHqs();
-  const defenderCandidates = buildPlacementCandidates(state.spacing, "defense");
   const enemyCandidates = buildPlacementCandidates(0, "enemy");
   enemyCandidateCount = enemyCandidates.length;
 
-  const variants = buildPlanVariants(defenderCandidates, enemyCandidates);
+  const plans = PLAN_SPACING_OPTIONS.flatMap((spacing) => {
+    const defenderCandidates = buildPlacementCandidates(spacing, "defense");
+    const variants = buildPlanVariants(defenderCandidates, enemyCandidates);
 
-  const bestPlan = variants
-    .map((plan) => buildSealedPlan(plan, state.spacing, enemyCandidates))
-    .map((plan) => pruneSealedPlan(plan, enemyCandidates))
-    .map((plan) => improveSealedPlanLayout(plan, enemyCandidates, defenderCandidates))
-    .map((plan) => pruneSealedPlan(plan, enemyCandidates))
-    .map((plan) => improveSealedPlanLayout(plan, enemyCandidates, defenderCandidates))
-    .map((plan) => ({
-      plan,
-      enemyOpen: countEnemyOpeningsForPlacements(plan, enemyCandidates),
-      quality: planLayoutPenalty(plan),
-    }))
-    .sort(
+    return variants
+      .map((plan) => buildSealedPlan(plan, spacing, enemyCandidates))
+      .map((plan) => pruneSealedPlan(plan, enemyCandidates))
+      .map((plan) => improveSealedPlanLayout(plan, enemyCandidates, defenderCandidates))
+      .map((plan) => pruneSealedPlan(plan, enemyCandidates))
+      .map((plan) => improveSealedPlanLayout(plan, enemyCandidates, defenderCandidates))
+      .map((plan) => {
+        const contact = contactClusterStats(plan);
+        return {
+          plan,
+          spacing,
+          contact,
+          enemyOpen: countEnemyOpeningsForPlacements(plan, enemyCandidates),
+          quality: planLayoutPenalty(plan),
+        };
+      });
+  });
+
+  const bestPlan = plans.sort(
     (a, b) =>
+      a.contact.excess - b.contact.excess ||
       a.enemyOpen - b.enemyOpen ||
       a.plan.length - b.plan.length ||
+      a.contact.largest - b.contact.largest ||
       a.quality - b.quality ||
+      b.spacing - a.spacing ||
       averagePlanDistance(a.plan) - averagePlanDistance(b.plan),
   )[0].plan;
 
-  return sortFillOrder(bestPlan);
+  const repairCandidates = buildPlacementCandidates(FIXED_SPACING, "defense");
+  const slidPlan = repairEnemyOpeningsBySliding(bestPlan, enemyCandidates, repairCandidates, {
+      passes: 7,
+      maxMoveDistance: 4,
+    });
+  const reinforcedPlan = addEnemyBlockingPlacements(slidPlan, enemyCandidates, repairCandidates, { maxAdds: 28 });
+
+  return sortFillOrder(
+    repairEnemyOpeningsBySliding(reinforcedPlan, enemyCandidates, repairCandidates, {
+      passes: 4,
+      maxMoveDistance: 4,
+    }),
+  );
 }
 
 function buildPlacementCandidates(spacing, placementType = "defense") {
@@ -447,13 +722,20 @@ function buildCoveragePlan(defenderCandidates, enemyCandidates) {
 function buildPlanVariants(defenderCandidates, enemyCandidates) {
   const sorters = [
     (a, b) => (isPlacementBefore(a, b) ? -1 : isPlacementBefore(b, a) ? 1 : 0),
-    (a, b) => a.distance - b.distance || a.angle - b.angle || a.anchor.y - b.anchor.y || a.anchor.x - b.anchor.x,
-    (a, b) => b.distance - a.distance || a.angle - b.angle || a.anchor.y - b.anchor.y || a.anchor.x - b.anchor.x,
-    (a, b) => a.anchor.y - b.anchor.y || a.anchor.x - b.anchor.x,
-    (a, b) => a.anchor.x - b.anchor.x || a.anchor.y - b.anchor.y,
-    (a, b) => b.anchor.y - a.anchor.y || a.anchor.x - b.anchor.x,
-    (a, b) => b.anchor.x - a.anchor.x || a.anchor.y - b.anchor.y,
-    (a, b) => a.angle - b.angle || a.distance - b.distance,
+    (a, b) =>
+      favorablePlacementScore(a) - favorablePlacementScore(b) ||
+      a.innerDistance - b.innerDistance ||
+      a.laneOrder - b.laneOrder ||
+      a.distance - b.distance ||
+      seededPlacementJitter(a) - seededPlacementJitter(b),
+    (a, b) =>
+      a.distance - b.distance ||
+      a.angle - b.angle ||
+      seededPlacementJitter(a) - seededPlacementJitter(b) ||
+      a.anchor.y - b.anchor.y ||
+      a.anchor.x - b.anchor.x,
+    (a, b) => a.anchor.y - b.anchor.y || seededPlacementJitter(a) - seededPlacementJitter(b) || a.anchor.x - b.anchor.x,
+    (a, b) => a.angle - b.angle || a.distance - b.distance || seededPlacementJitter(a) - seededPlacementJitter(b),
   ];
 
   return [
@@ -490,12 +772,15 @@ function buildSealedPlan(startingPlan, preferredSpacing, enemyCandidates) {
     while (openEnemyIds.size) {
       const reserved = reservedKeysForPlacements(plan, spacing);
       const selectedIds = new Set(plan.map((placement) => placement.id));
+      const contactCounts = contactCountsForPlacements(plan);
+      const cellIndex = placementCellIndex(plan);
       let bestCandidate = null;
       let bestBlockedIds = null;
 
       candidates.forEach((candidate) => {
         if (selectedIds.has(candidate.id)) return;
         if (candidate.cellKeys.some((key) => reserved.has(key))) return;
+        if (wouldExceedContactCluster(candidate, plan, MAX_CONTACT_CLUSTER_SIZE, contactCounts, cellIndex)) return;
 
         const blockedIds = blockedEnemyIdsFor(candidate, enemyByCell, openEnemyIds);
         if (!blockedIds.size) return;
@@ -524,7 +809,7 @@ function improveSealedPlanLayout(plan, enemyCandidates, defenderCandidates) {
   let improved = [...plan];
   let currentPenalty = planLayoutPenalty(improved);
 
-  for (let pass = 0; pass < 4; pass += 1) {
+  for (let pass = 0; pass < 2; pass += 1) {
     let changed = false;
     const worstPlacements = [...improved]
       .map((placement) => ({
@@ -541,9 +826,14 @@ function improveSealedPlanLayout(plan, enemyCandidates, defenderCandidates) {
       const withoutTarget = improved.filter((placement) => placement.id !== target.id);
       const reserved = reservedKeysForPlacements(withoutTarget, state.spacing);
       const selectedIds = new Set(withoutTarget.map((placement) => placement.id));
+      const contactCounts = contactCountsForPlacements(withoutTarget);
+      const cellIndex = placementCellIndex(withoutTarget);
       const options = defenderCandidates
         .filter((candidate) => candidate.id !== target.id && !selectedIds.has(candidate.id))
         .filter((candidate) => !candidate.cellKeys.some((key) => reserved.has(key)))
+        .filter((candidate) =>
+          !wouldExceedContactCluster(candidate, withoutTarget, MAX_CONTACT_CLUSTER_SIZE, contactCounts, cellIndex)
+        )
         .sort((a, b) => coverageCandidateScore(a, withoutTarget) - coverageCandidateScore(b, withoutTarget))
         .slice(0, 90);
 
@@ -567,6 +857,137 @@ function improveSealedPlanLayout(plan, enemyCandidates, defenderCandidates) {
   }
 
   return improved;
+}
+
+function repairEnemyOpeningsBySliding(plan, enemyCandidates, defenderCandidates, { passes = 5, maxMoveDistance = 4 } = {}) {
+  let repaired = [...plan];
+  let baselineOpen = countEnemyOpeningsForPlacements(repaired, enemyCandidates);
+  let baselineEdges = contactEdgeCount(repaired);
+
+  for (let pass = 0; pass < passes && baselineOpen > 0; pass += 1) {
+    const visibleEnemyPack = enemyPlacementPackForPlacements(repaired, enemyCandidates);
+    if (!visibleEnemyPack.length) break;
+
+    const enemyCells = new Set(visibleEnemyPack.flatMap((enemy) => enemy.cellKeys));
+    const currentContactCounts = contactCountsForPlacements(repaired);
+    const movers = [...repaired]
+      .map((placement) => ({
+        placement,
+        enemyDistance: nearestDistanceToGroup(placement, visibleEnemyPack),
+        contactCount: currentContactCounts.get(placement.id) || 0,
+      }))
+      .filter(({ enemyDistance }) => enemyDistance <= 9)
+      .sort(
+        (a, b) =>
+          a.enemyDistance - b.enemyDistance ||
+          b.contactCount - a.contactCount ||
+          innerCleanlinessWeight(b.placement) - innerCleanlinessWeight(a.placement) ||
+          seededPlacementJitter(a.placement) - seededPlacementJitter(b.placement),
+      )
+      .slice(0, 70);
+    let changed = false;
+
+    for (const { placement: target } of movers) {
+      const withoutTarget = repaired.filter((placement) => placement.id !== target.id);
+      const occupied = new Set(withoutTarget.flatMap((placement) => placement.cellKeys));
+      const contactCounts = contactCountsForPlacements(withoutTarget);
+      const cellIndex = placementCellIndex(withoutTarget);
+      const options = defenderCandidates
+        .filter((candidate) => candidate.id !== target.id)
+        .filter((candidate) => hexDistance(candidate.anchor, target.anchor) <= maxMoveDistance)
+        .filter((candidate) => !candidate.cellKeys.some((key) => occupied.has(key)))
+        .filter((candidate) =>
+          !wouldExceedContactCluster(candidate, withoutTarget, MAX_CONTACT_CLUSTER_SIZE, contactCounts, cellIndex)
+        )
+        .map((candidate) => ({
+          candidate,
+          blocksVisible: candidate.cellKeys.filter((key) => enemyCells.has(key)).length,
+        }))
+        .filter((option) => option.blocksVisible)
+        .sort(
+          (a, b) =>
+            b.blocksVisible - a.blocksVisible ||
+            hexDistance(a.candidate.anchor, target.anchor) - hexDistance(b.candidate.anchor, target.anchor) ||
+            coverageCandidateScore(a.candidate, withoutTarget) - coverageCandidateScore(b.candidate, withoutTarget),
+        )
+        .slice(0, 28);
+
+      for (const { candidate } of options) {
+        const proposal = [...withoutTarget, candidate];
+        const nextContact = contactClusterStats(proposal);
+        if (nextContact.excess) continue;
+
+        const nextOpen = countEnemyOpeningsForPlacements(proposal, enemyCandidates);
+        const nextEdges = contactEdgeCount(proposal);
+        const improvesOpen = nextOpen < baselineOpen;
+        const improvesEdges = nextOpen === baselineOpen && nextEdges < baselineEdges;
+        if (!improvesOpen && !improvesEdges) continue;
+
+        repaired = proposal;
+        baselineOpen = nextOpen;
+        baselineEdges = nextEdges;
+        changed = true;
+        break;
+      }
+
+      if (changed) break;
+    }
+
+    if (!changed) break;
+  }
+
+  return repaired;
+}
+
+function addEnemyBlockingPlacements(plan, enemyCandidates, defenderCandidates, { maxAdds = 20 } = {}) {
+  let reinforced = [...plan];
+  let baselineOpen = countEnemyOpeningsForPlacements(reinforced, enemyCandidates);
+
+  for (let added = 0; added < maxAdds && baselineOpen > 0; added += 1) {
+    const visibleEnemyPack = enemyPlacementPackForPlacements(reinforced, enemyCandidates);
+    const enemyCells = new Set(visibleEnemyPack.flatMap((enemy) => enemy.cellKeys));
+    const occupied = new Set(reinforced.flatMap((placement) => placement.cellKeys));
+    const contactCounts = contactCountsForPlacements(reinforced);
+    const cellIndex = placementCellIndex(reinforced);
+    const options = defenderCandidates
+      .filter((candidate) => !candidate.cellKeys.some((key) => occupied.has(key)))
+      .filter((candidate) =>
+        !wouldExceedContactCluster(candidate, reinforced, MAX_CONTACT_CLUSTER_SIZE, contactCounts, cellIndex)
+      )
+      .map((candidate) => ({
+        candidate,
+        blocksVisible: candidate.cellKeys.filter((key) => enemyCells.has(key)).length,
+        touchCount: touchedPlacements(candidate, reinforced, cellIndex).length,
+      }))
+      .filter((option) => option.blocksVisible)
+      .sort(
+        (a, b) =>
+          b.blocksVisible - a.blocksVisible ||
+          a.touchCount - b.touchCount ||
+          coverageCandidateScore(a.candidate, reinforced) - coverageCandidateScore(b.candidate, reinforced),
+      )
+      .slice(0, 90);
+
+    let best = null;
+
+    for (const { candidate } of options) {
+      const proposal = [...reinforced, candidate];
+      const nextOpen = countEnemyOpeningsForPlacements(proposal, enemyCandidates);
+      if (nextOpen >= baselineOpen) continue;
+
+      const nextEdges = contactEdgeCount(proposal);
+      const score = nextOpen * 1000000 + nextEdges * 60000 + planLayoutPenalty(proposal);
+      if (!best || score < best.score) {
+        best = { candidate, nextOpen, score };
+      }
+    }
+
+    if (!best) break;
+    reinforced = [...reinforced, best.candidate];
+    baselineOpen = best.nextOpen;
+  }
+
+  return reinforced;
 }
 
 function pruneSealedPlan(plan, enemyCandidates) {
@@ -691,7 +1112,13 @@ function isBetterCoverageCandidate(candidate, blockedIds, bestCandidate, bestBlo
 }
 
 function coverageCandidateScore(candidate, currentPlacements = []) {
-  return candidate.innerDistance * 9 + candidate.distance * 0.08 + sealedPlanClumpPenalty(candidate, currentPlacements);
+  return (
+    candidate.innerDistance * 9 +
+    candidate.distance * 0.08 +
+    favorablePlacementScore(candidate) * 145 +
+    seededPlacementJitter(candidate, 18) +
+    sealedPlanClumpPenalty(candidate, currentPlacements)
+  );
 }
 
 function sealedPlanClumpPenalty(candidate, currentPlacements = []) {
@@ -727,6 +1154,18 @@ function isPlacementBefore(a, b) {
   );
 }
 
+function favorablePlacementScore(candidate) {
+  if (favorableScoreCache.has(candidate.id)) return favorableScoreCache.get(candidate.id);
+
+  const score = KNOWN_GOOD_STANDALONE_ANCHORS.reduce(
+    (best, anchor) => Math.min(best, hexDistance(candidate.anchor, anchor)),
+    Number.POSITIVE_INFINITY,
+  );
+
+  favorableScoreCache.set(candidate.id, score);
+  return score;
+}
+
 function countEnemyOpenings(currentAssignments) {
   return countEnemyOpeningsForPlacements(
     currentAssignments.filter((assignment) => !assignment.shortfall),
@@ -735,6 +1174,10 @@ function countEnemyOpenings(currentAssignments) {
 }
 
 function countEnemyOpeningsForPlacements(placements, enemyCandidates, supportPlacements = outerSupportPlan) {
+  return enemyPlacementPackForPlacements(placements, enemyCandidates, supportPlacements).length;
+}
+
+function enemyPlacementPackForPlacements(placements, enemyCandidates = buildPlacementCandidates(0, "enemy"), supportPlacements = outerSupportPlan) {
   const occupied = new Set();
 
   [...placements, ...supportPlacements].forEach((placement) => placement.cellKeys.forEach((key) => occupied.add(key)));
@@ -743,7 +1186,7 @@ function countEnemyOpeningsForPlacements(placements, enemyCandidates, supportPla
     enemyCandidate.cellKeys.every((key) => !occupied.has(key)),
   );
 
-  return buildBestEnemyPack(openEnemyCandidates).length;
+  return buildBestEnemyPack(openEnemyCandidates);
 }
 
 function buildBestEnemyPack(enemyCandidates) {
@@ -827,22 +1270,27 @@ function sealAssignmentOpenings(currentAssignments) {
     const occupied = new Set(activePlacements.flatMap((placement) => placement.cellKeys));
     let best = null;
 
-    available.forEach((placement, placementIndex) => {
-      if (placement.cellKeys.some((key) => occupied.has(key))) return;
-      const blockedIds = blockedEnemyIdsFor(placement, enemyByCell, openEnemyIds);
-      if (!blockedIds.size) return;
+    [true, false].some((requireLane) => {
+      available.forEach((placement, placementIndex) => {
+        if (placement.cellKeys.some((key) => occupied.has(key))) return;
+        const blockedIds = blockedEnemyIdsFor(placement, enemyByCell, openEnemyIds);
+        if (!blockedIds.size) return;
 
-      const allianceOptions = sealingAllianceOptions(placement, activeAlliances, laneMeta, placementsByAllianceId, placeholders, true);
+        const allianceOptions = sealingAllianceOptions(placement, activeAlliances, laneMeta, placementsByAllianceId, placeholders, requireLane);
 
-      allianceOptions.forEach((option) => {
-        const picked = placementsByAllianceId.get(option.alliance.id) || [];
-        const laneScore = option.meta ? allianceLaneScore(placement, option.meta, picked) : placement.innerDistance;
-        const fillBalancePenalty = option.placeholder ? 0 : 2800000;
-        const score = -blockedIds.size * 10000000 + fillBalancePenalty + laneScore + option.allianceIndex * 0.01;
-        if (!best || score < best.score) {
-          best = { ...option, placement, placementIndex, blockedIds, score };
-        }
+        allianceOptions.forEach((option) => {
+          const picked = placementsByAllianceId.get(option.alliance.id) || [];
+          const laneScore = option.meta ? allianceLaneScore(placement, option.meta, picked) : placement.innerDistance;
+          const lanePenalty = option.inLane ? 0 : 1800000;
+          const fillBalancePenalty = option.placeholder ? 0 : 2800000;
+          const score = -blockedIds.size * 10000000 + fillBalancePenalty + lanePenalty + laneScore + option.allianceIndex * 0.01;
+          if (!best || score < best.score) {
+            best = { ...option, placement, placementIndex, blockedIds, score };
+          }
+        });
       });
+
+      return Boolean(best);
     });
 
     if (!best) break;
@@ -921,9 +1369,7 @@ function reduceCleanSealedAssignments(currentAssignments) {
           penalty: sealedPlanClumpPenalty(assignment, others) + innerCleanlinessWeight(assignment) * 450,
         };
       })
-      .filter((option) => option.penalty > 0)
-      .sort((a, b) => b.penalty - a.penalty)
-      .slice(0, 24);
+      .sort((a, b) => b.penalty - a.penalty);
 
     let changed = false;
 
@@ -978,9 +1424,14 @@ function findSealingMoveAfterRemoval(activePlacements, openEnemyIds, enemyCandid
   for (const { assignment } of movers) {
     const others = activePlacements.filter((placement) => placement.id !== assignment.id);
     const occupied = new Set(others.flatMap((placement) => placement.cellKeys));
+    const contactCounts = contactCountsForPlacements(others);
+    const cellIndex = placementCellIndex(others);
     const options = defenseCandidates
       .filter((candidate) => candidate.id !== assignment.id)
       .filter((candidate) => !candidate.cellKeys.some((key) => occupied.has(key)))
+      .filter((candidate) =>
+        !wouldExceedContactCluster(candidate, others, MAX_CONTACT_CLUSTER_SIZE, contactCounts, cellIndex)
+      )
       .map((candidate) => ({
         candidate,
         blocked: blockedEnemyIdsFor(candidate, enemyByCell, openEnemyIds).size,
@@ -1001,28 +1452,407 @@ function findSealingMoveAfterRemoval(activePlacements, openEnemyIds, enemyCandid
   return null;
 }
 
+function sleep(ms = 0) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function optimizeActivePlacementsFurther(currentAssignments, { durationMs = 30000, onProgress = () => {} } = {}) {
+  const deadline = Date.now() + durationMs;
+  let lastYield = 0;
+  const yieldIfNeeded = async () => {
+    const now = Date.now();
+    if (now - lastYield < 140) return;
+    lastYield = now;
+    onProgress(Math.max(0, Math.ceil((deadline - now) / 1000)));
+    await sleep(0);
+  };
+
+  onProgress(Math.max(0, Math.ceil((deadline - Date.now()) / 1000)));
+  await sleep(0);
+
+  const enemyCandidates = buildPlacementCandidates(0, "enemy");
+  await yieldIfNeeded();
+  const defenseCandidates = buildPlacementCandidates(FIXED_SPACING, "defense");
+  await yieldIfNeeded();
+  let activePlacements = currentAssignments.filter((assignment) => !assignment.shortfall).map((assignment) => ({ ...assignment }));
+  let baselineOpen = countEnemyOpeningsForPlacements(activePlacements, enemyCandidates);
+  let baselineEdges = contactEdgeCount(activePlacements);
+
+  for (let pass = 0; pass < 20 && baselineEdges > 0 && Date.now() < deadline; pass += 1) {
+    await yieldIfNeeded();
+    const rebuilt = await optimizeByRebuildingContactClusters(
+      activePlacements,
+      enemyCandidates,
+      defenseCandidates,
+      baselineOpen,
+      baselineEdges,
+      deadline,
+      yieldIfNeeded,
+    );
+    if (rebuilt) {
+      activePlacements = rebuilt.plan;
+      baselineOpen = rebuilt.open;
+      baselineEdges = rebuilt.edges;
+      continue;
+    }
+
+    const slidForSeal = repairEnemyOpeningsBySliding(activePlacements, enemyCandidates, defenseCandidates, {
+      passes: 2,
+      maxMoveDistance: 5,
+    });
+    const slidOpen = countEnemyOpeningsForPlacements(slidForSeal, enemyCandidates);
+    const slidEdges = contactEdgeCount(slidForSeal);
+    if (slidOpen < baselineOpen || (slidOpen === baselineOpen && slidEdges < baselineEdges)) {
+      activePlacements = slidForSeal;
+      baselineOpen = slidOpen;
+      baselineEdges = slidEdges;
+      continue;
+    }
+
+    const reinforcedForSeal = addEnemyBlockingPlacements(activePlacements, enemyCandidates, defenseCandidates, { maxAdds: 8 });
+    const reinforcedOpen = countEnemyOpeningsForPlacements(reinforcedForSeal, enemyCandidates);
+    const reinforcedEdges = contactEdgeCount(reinforcedForSeal);
+    if (reinforcedOpen < baselineOpen || (reinforcedOpen === baselineOpen && reinforcedEdges < baselineEdges)) {
+      activePlacements = reinforcedForSeal;
+      baselineOpen = reinforcedOpen;
+      baselineEdges = reinforcedEdges;
+      continue;
+    }
+
+    const contactCounts = contactCountsForPlacements(activePlacements);
+    const contactedPlacements = activePlacements.filter((placement) => (contactCounts.get(placement.id) || 0) > 0);
+    const movers = [...activePlacements]
+      .filter(
+        (placement) =>
+          (contactCounts.get(placement.id) || 0) > 0 ||
+          contactedPlacements.some((contacted) => hexDistance(placement.anchor, contacted.anchor) <= 10),
+      )
+      .sort(
+        (a, b) =>
+          (contactCounts.get(b.id) || 0) - (contactCounts.get(a.id) || 0) ||
+          nearestContactedDistance(a, contactedPlacements) - nearestContactedDistance(b, contactedPlacements) ||
+          innerCleanlinessWeight(b) - innerCleanlinessWeight(a) ||
+          b.innerDistance - a.innerDistance,
+      );
+    let changed = false;
+
+    for (const target of movers) {
+      await yieldIfNeeded();
+      const withoutTarget = activePlacements.filter((placement) => placement.id !== target.id);
+      const occupied = new Set(withoutTarget.flatMap((placement) => placement.cellKeys));
+      const withoutContactCounts = contactCountsForPlacements(withoutTarget);
+      const withoutCellIndex = placementCellIndex(withoutTarget);
+      const targetContactCount = contactCounts.get(target.id) || 0;
+      const currentPenalty = planLayoutPenalty(activePlacements);
+      const options = defenseCandidates
+        .filter((candidate) => candidate.id !== target.id)
+        .filter((candidate) => {
+          const blockers = overlappingPlacements(candidate, withoutTarget, withoutCellIndex);
+          if (!blockers.length) {
+            return !wouldExceedContactCluster(candidate, withoutTarget, MAX_CONTACT_CLUSTER_SIZE, withoutContactCounts, withoutCellIndex);
+          }
+
+          return targetContactCount > 0 && isStandaloneDisplacementCandidate(target, blockers, contactCounts);
+        })
+        .sort((a, b) => optimizeFurtherCandidateScore(a, withoutTarget, target) - optimizeFurtherCandidateScore(b, withoutTarget, target))
+        .slice(0, 50);
+
+      for (const candidate of options) {
+        if (Date.now() >= deadline) break;
+        await yieldIfNeeded();
+        const proposal = buildOptimizationProposal(
+          target,
+          candidate,
+          withoutTarget,
+          withoutCellIndex,
+          contactCounts,
+          defenseCandidates,
+          enemyCandidates,
+          baselineOpen,
+          deadline,
+        );
+        if (!proposal) continue;
+
+        const nextOpen = countEnemyOpeningsForPlacements(proposal, enemyCandidates);
+        if (nextOpen > baselineOpen) continue;
+
+        const nextContact = contactClusterStats(proposal);
+        if (nextContact.excess) continue;
+
+        const nextEdges = contactEdgeCount(proposal);
+        const nextPenalty = planLayoutPenalty(proposal);
+        const improvesEdges = nextEdges < baselineEdges;
+        const improvesLayout = nextEdges === baselineEdges && nextPenalty < currentPenalty - 5000;
+        if (!improvesEdges && !improvesLayout) continue;
+
+        activePlacements = proposal;
+        baselineOpen = nextOpen;
+        baselineEdges = nextEdges;
+        changed = true;
+        break;
+      }
+
+      if (changed) break;
+      if (Date.now() >= deadline) break;
+    }
+
+    if (!changed) break;
+  }
+
+  return activePlacements;
+}
+
+function nearestContactedDistance(placement, contactedPlacements) {
+  if (!contactedPlacements.length) return Number.POSITIVE_INFINITY;
+  return contactedPlacements.reduce(
+    (closest, contacted) => Math.min(closest, hexDistance(placement.anchor, contacted.anchor)),
+    Number.POSITIVE_INFINITY,
+  );
+}
+
+async function optimizeByRebuildingContactClusters(
+  activePlacements,
+  enemyCandidates,
+  defenseCandidates,
+  baselineOpen,
+  baselineEdges,
+  deadline,
+  yieldIfNeeded,
+) {
+  const clusters = contactClusters(activePlacements);
+
+  for (const cluster of clusters) {
+    if (Date.now() >= deadline) break;
+    await yieldIfNeeded();
+
+    const clusterIds = new Set(cluster.members.map((placement) => placement.id));
+    const basePlan = activePlacements.filter((placement) => !clusterIds.has(placement.id));
+    const baseOpen = countEnemyOpeningsForPlacements(basePlan, enemyCandidates);
+    const baseEdges = contactEdgeCount(basePlan);
+
+    if (baseOpen <= baselineOpen && baseEdges < baselineEdges) {
+      return { plan: basePlan, open: baseOpen, edges: baseEdges };
+    }
+
+    const rebuilt = await rebuildRemovedCluster(
+      basePlan,
+      cluster,
+      enemyCandidates,
+      defenseCandidates,
+      baselineOpen,
+      baselineEdges,
+      deadline,
+      yieldIfNeeded,
+    );
+    if (rebuilt) return rebuilt;
+  }
+
+  return null;
+}
+
+async function rebuildRemovedCluster(
+  basePlan,
+  cluster,
+  enemyCandidates,
+  defenseCandidates,
+  baselineOpen,
+  baselineEdges,
+  deadline,
+  yieldIfNeeded,
+) {
+  let plan = [...basePlan];
+  let openIds = openEnemyIdsForPlacements(plan, enemyCandidates);
+  let openCount = countEnemyOpeningsForPlacements(plan, enemyCandidates);
+  const maxAdds = cluster.members.length;
+  const enemyByCell = enemyCellIndex(enemyCandidates);
+
+  for (let added = 0; added < maxAdds && openCount > baselineOpen && Date.now() < deadline; added += 1) {
+    await yieldIfNeeded();
+    const occupied = new Set(plan.flatMap((placement) => placement.cellKeys));
+    const contactCounts = contactCountsForPlacements(plan);
+    const cellIndex = placementCellIndex(plan);
+    const options = defenseCandidates
+      .filter((candidate) => !candidate.cellKeys.some((key) => occupied.has(key)))
+      .filter((candidate) =>
+        !wouldExceedContactCluster(candidate, plan, MAX_CONTACT_CLUSTER_SIZE, contactCounts, cellIndex)
+      )
+      .map((candidate) => ({
+        candidate,
+        blocked: blockedEnemyIdsFor(candidate, enemyByCell, openIds).size,
+        touches: touchedPlacements(candidate, plan, cellIndex).length,
+        distance: distanceToCluster(candidate, cluster),
+      }))
+      .filter((option) => option.blocked)
+      .filter((option) => option.distance <= 18 || option.blocked >= 5)
+      .sort((a, b) => clusterRepairScore(a, plan, cluster) - clusterRepairScore(b, plan, cluster))
+      .slice(0, 90);
+
+    let bestPlan = null;
+    let bestOpenIds = null;
+    let bestOpenCount = Number.POSITIVE_INFINITY;
+    let bestScore = Number.POSITIVE_INFINITY;
+
+    for (const { candidate } of options) {
+      if (Date.now() >= deadline) break;
+      const proposal = [...plan, { ...candidate, flexAdjusted: true, clusterRebuild: true }];
+      const nextOpenIds = openEnemyIdsForPlacements(proposal, enemyCandidates);
+      const nextOpenCount = countEnemyOpeningsForPlacements(proposal, enemyCandidates);
+      const nextContact = contactClusterStats(proposal);
+      if (nextContact.excess) continue;
+
+      const nextEdges = contactEdgeCount(proposal);
+      const score = nextOpenCount * 1000000 + nextOpenIds.size * 1800 + nextEdges * 50000 + planLayoutPenalty(proposal);
+      if (score < bestScore) {
+        bestPlan = proposal;
+        bestOpenIds = nextOpenIds;
+        bestOpenCount = nextOpenCount;
+        bestScore = score;
+      }
+    }
+
+    if (!bestPlan) break;
+    plan = bestPlan;
+    openIds = bestOpenIds;
+    openCount = bestOpenCount;
+  }
+
+  const finalOpen = openCount;
+  if (finalOpen > baselineOpen) return null;
+
+  const finalContact = contactClusterStats(plan);
+  if (finalContact.excess) return null;
+
+  const finalEdges = contactEdgeCount(plan);
+  const removedCount = cluster.members.length;
+  const addedCount = plan.length - basePlan.length;
+  const reducedEdges = finalEdges < baselineEdges;
+  const reducedCount = addedCount < removedCount && finalEdges <= baselineEdges;
+  const cleanerLayout = finalEdges === baselineEdges && planLayoutPenalty(plan) < planLayoutPenalty([...basePlan, ...cluster.members]) - 5000;
+
+  if (!reducedEdges && !reducedCount && !cleanerLayout) return null;
+  return { plan, open: finalOpen, edges: finalEdges };
+}
+
+function distanceToCluster(candidate, cluster) {
+  return cluster.members.reduce(
+    (closest, placement) => Math.min(closest, hexDistance(candidate.anchor, placement.anchor)),
+    Number.POSITIVE_INFINITY,
+  );
+}
+
+function clusterRepairScore(option, plan, cluster) {
+  return (
+    -option.blocked * 9000000 +
+    option.touches * 1200000 +
+    option.distance * 2400 +
+    favorablePlacementScore(option.candidate) * 150 +
+    coverageCandidateScore(option.candidate, plan) +
+    Math.abs(option.candidate.innerDistance - cluster.members[0].innerDistance) * 30
+  );
+}
+
+function isStandaloneDisplacementCandidate(target, blockers, contactCounts) {
+  return (
+    blockers.length === 1 &&
+    (contactCounts.get(blockers[0].id) || 0) === 0 &&
+    hexDistance(target.anchor, blockers[0].anchor) <= 10
+  );
+}
+
+function buildOptimizationProposal(
+  target,
+  candidate,
+  withoutTarget,
+  withoutCellIndex,
+  contactCounts,
+  defenseCandidates,
+  enemyCandidates,
+  baselineOpen,
+  deadline,
+) {
+  const blockers = overlappingPlacements(candidate, withoutTarget, withoutCellIndex);
+
+  if (!blockers.length) {
+    return [...withoutTarget, { ...target, ...candidate, flexAdjusted: true }];
+  }
+
+  if (!isStandaloneDisplacementCandidate(target, blockers, contactCounts)) return null;
+
+  const [blocker] = blockers;
+  const withoutTargetAndBlocker = withoutTarget.filter((placement) => placement.id !== blocker.id);
+  const movedTarget = { ...target, ...candidate, flexAdjusted: true };
+  const targetContactCounts = contactCountsForPlacements(withoutTargetAndBlocker);
+  const targetCellIndex = placementCellIndex(withoutTargetAndBlocker);
+  if (wouldExceedContactCluster(movedTarget, withoutTargetAndBlocker, MAX_CONTACT_CLUSTER_SIZE, targetContactCounts, targetCellIndex)) {
+    return null;
+  }
+
+  const relocatedBlocker = findStandaloneRelocation(
+    blocker,
+    [...withoutTargetAndBlocker, movedTarget],
+    defenseCandidates,
+    enemyCandidates,
+    baselineOpen,
+    deadline,
+  );
+  if (!relocatedBlocker) return null;
+
+  return [...withoutTargetAndBlocker, movedTarget, relocatedBlocker];
+}
+
+function findStandaloneRelocation(blocker, fixedPlacements, defenseCandidates, enemyCandidates, baselineOpen, deadline) {
+  const occupied = new Set(fixedPlacements.flatMap((placement) => placement.cellKeys));
+  const contactCounts = contactCountsForPlacements(fixedPlacements);
+  const cellIndex = placementCellIndex(fixedPlacements);
+  const options = defenseCandidates
+    .filter((candidate) => candidate.id !== blocker.id)
+    .filter((candidate) => !candidate.cellKeys.some((key) => occupied.has(key)))
+    .filter((candidate) =>
+      !wouldExceedContactCluster(candidate, fixedPlacements, MAX_CONTACT_CLUSTER_SIZE, contactCounts, cellIndex)
+    )
+    .sort(
+      (a, b) =>
+        touchedPlacements(a, fixedPlacements, cellIndex).length - touchedPlacements(b, fixedPlacements, cellIndex).length ||
+        favorablePlacementScore(a) - favorablePlacementScore(b) ||
+        hexDistance(a.anchor, blocker.anchor) - hexDistance(b.anchor, blocker.anchor) ||
+        coverageCandidateScore(a, fixedPlacements) - coverageCandidateScore(b, fixedPlacements),
+    )
+    .slice(0, 35);
+
+  for (const candidate of options) {
+    if (Date.now() >= deadline) break;
+    const movedBlocker = { ...blocker, ...candidate, flexAdjusted: true };
+    const proposal = [...fixedPlacements, movedBlocker];
+    if (countEnemyOpeningsForPlacements(proposal, enemyCandidates) <= baselineOpen) return movedBlocker;
+  }
+
+  return null;
+}
+
+function optimizeFurtherCandidateScore(candidate, currentPlacements, target) {
+  return (
+    touchedPlacements(candidate, currentPlacements).length * 900000 +
+    contactEdgeCount([...currentPlacements, candidate]) * 55000 +
+    hexDistance(candidate.anchor, target.anchor) * 500 +
+    coverageCandidateScore(candidate, currentPlacements) +
+    favorablePlacementScore(candidate) * 80
+  );
+}
+
 function rebalanceAllianceOwnership(currentAssignments) {
   const activePlacements = currentAssignments.filter((assignment) => !assignment.shortfall);
   const activeAlliances = state.alliances.filter((alliance) => alliance.count > 0);
   if (!activePlacements.length || !activeAlliances.length) return currentAssignments;
 
   const targets = flexibleAllianceTargets(activeAlliances, activePlacements.length);
-  const orderedPlacements = [...activePlacements].sort((a, b) =>
-    laneOrderValue(a) - laneOrderValue(b) ||
-    a.innerDistance - b.innerDistance ||
-    a.distance - b.distance ||
-    a.anchor.y - b.anchor.y ||
-    a.anchor.x - b.anchor.x,
-  );
+  const placementsByAlliance = assignStrategicAllianceGroups(activeAlliances, activePlacements, targets);
 
   const balanced = [];
-  let cursor = 0;
 
   state.alliances.forEach((alliance, allianceIndex) => {
     const filledTarget = targets.get(alliance.id) || 0;
     const color = ALLIANCE_COLORS[allianceIndex % ALLIANCE_COLORS.length];
-    const placements = orderedPlacements
-      .slice(cursor, cursor + filledTarget)
+    const placements = (placementsByAlliance.get(alliance.id) || [])
       .sort((a, b) => (isPlacementBefore(a, b) ? -1 : isPlacementBefore(b, a) ? 1 : 0));
 
     placements.forEach((placement, index) => {
@@ -1049,11 +1879,201 @@ function rebalanceAllianceOwnership(currentAssignments) {
         number: index + 1,
       });
     }
-
-    cursor += filledTarget;
   });
 
   return balanced;
+}
+
+function assignStrategicAllianceGroups(activeAlliances, activePlacements, targets) {
+  const available = [...activePlacements];
+  const placementsByAlliance = new Map();
+
+  activeAlliances.forEach((alliance, allianceIndex) => {
+    const target = targets.get(alliance.id) || 0;
+    const picked = [];
+    const anchor = strategicGroupStartForAlliance(allianceIndex, activeAlliances.length);
+
+    while (picked.length < target && available.length) {
+      const best = removeBestPlacement(available, (candidate) =>
+        strategicGroupScore(candidate, picked, anchor, allianceIndex, activeAlliances.length),
+      );
+      if (!best) break;
+      picked.push(best);
+    }
+
+    placementsByAlliance.set(alliance.id, picked);
+  });
+
+  return mergeDetachedAllianceComponents(placementsByAlliance, activeAlliances);
+}
+
+function mergeDetachedAllianceComponents(placementsByAlliance, activeAlliances) {
+  for (let pass = 0; pass < 4; pass += 1) {
+    let moved = false;
+
+    activeAlliances.forEach((alliance) => {
+      const placements = placementsByAlliance.get(alliance.id) || [];
+      const components = alliancePlacementComponents(placements);
+      if (components.length <= 1) return;
+
+      const keep = components[0];
+      const detached = components.slice(1).flat();
+      placementsByAlliance.set(alliance.id, keep);
+
+      detached.forEach((placement) => {
+        const swapped = trySwapDetachedPlacement(placement, alliance, activeAlliances, placementsByAlliance);
+        if (swapped) {
+          moved = true;
+          return;
+        }
+
+        const targetAlliance = nearestAllianceGroupForPlacement(placement, activeAlliances, placementsByAlliance, alliance.id);
+        if (!targetAlliance) {
+          keep.push(placement);
+          return;
+        }
+
+        placementsByAlliance.get(targetAlliance.id).push(placement);
+        moved = true;
+      });
+    });
+
+    if (!moved) break;
+  }
+
+  return placementsByAlliance;
+}
+
+function trySwapDetachedPlacement(detachedPlacement, sourceAlliance, activeAlliances, placementsByAlliance) {
+  const sourceGroup = placementsByAlliance.get(sourceAlliance.id) || [];
+  if (!sourceGroup.length) return false;
+
+  const sourceAnchorDistance = nearestDistanceToGroup(detachedPlacement, sourceGroup);
+  let bestSwap = null;
+
+  activeAlliances.forEach((targetAlliance) => {
+    if (targetAlliance.id === sourceAlliance.id) return;
+    const targetGroup = placementsByAlliance.get(targetAlliance.id) || [];
+    if (!targetGroup.length) return;
+
+    const detachedToTarget = nearestDistanceToGroup(detachedPlacement, targetGroup);
+    if (detachedToTarget >= sourceAnchorDistance) return;
+
+    targetGroup.forEach((targetPlacement) => {
+      const targetToSource = nearestDistanceToGroup(targetPlacement, sourceGroup);
+      const targetToOwn = nearestDistanceToGroup(
+        targetPlacement,
+        targetGroup.filter((placement) => placement.id !== targetPlacement.id),
+      );
+      if (targetToSource >= targetToOwn) return;
+
+      const before = sourceAnchorDistance + targetToOwn;
+      const after = detachedToTarget + targetToSource;
+      if (after >= before) return;
+
+      const score = after - before;
+      if (!bestSwap || score < bestSwap.score) {
+        bestSwap = { targetAlliance, targetPlacement, score };
+      }
+    });
+  });
+
+  if (!bestSwap) return false;
+
+  const targetGroup = placementsByAlliance.get(bestSwap.targetAlliance.id);
+  placementsByAlliance.set(
+    bestSwap.targetAlliance.id,
+    targetGroup.filter((placement) => placement.id !== bestSwap.targetPlacement.id).concat(detachedPlacement),
+  );
+  sourceGroup.push(bestSwap.targetPlacement);
+  return true;
+}
+
+function nearestDistanceToGroup(placement, group) {
+  if (!group.length) return Number.POSITIVE_INFINITY;
+  return group.reduce(
+    (closest, other) => Math.min(closest, hexDistance(placement.anchor, other.anchor)),
+    Number.POSITIVE_INFINITY,
+  );
+}
+
+function alliancePlacementComponents(placements, maxGap = 11) {
+  const visited = new Set();
+  const components = [];
+
+  placements.forEach((placement) => {
+    if (visited.has(placement.id)) return;
+
+    const queue = [placement];
+    const component = [];
+    visited.add(placement.id);
+
+    while (queue.length) {
+      const current = queue.shift();
+      component.push(current);
+
+      placements.forEach((other) => {
+        if (visited.has(other.id)) return;
+        if (hexDistance(current.anchor, other.anchor) > maxGap) return;
+        visited.add(other.id);
+        queue.push(other);
+      });
+    }
+
+    components.push(component);
+  });
+
+  return components.sort((a, b) => b.length - a.length);
+}
+
+function nearestAllianceGroupForPlacement(placement, activeAlliances, placementsByAlliance, sourceAllianceId) {
+  return activeAlliances
+    .filter((alliance) => alliance.id !== sourceAllianceId)
+    .map((alliance) => {
+      const group = placementsByAlliance.get(alliance.id) || [];
+      const nearest = group.reduce(
+        (closest, existing) => Math.min(closest, hexDistance(placement.anchor, existing.anchor)),
+        Number.POSITIVE_INFINITY,
+      );
+      const allianceIndex = activeAlliances.findIndex((item) => item.id === alliance.id);
+      const anchor = strategicGroupStartForAlliance(allianceIndex, activeAlliances.length);
+      return {
+        alliance,
+        score:
+          (Number.isFinite(nearest) ? nearest : 80) * 120 +
+          hexDistance(placement.anchor, anchor) * 8 +
+          allianceIndex * 0.001,
+      };
+    })
+    .sort((a, b) => a.score - b.score)[0]?.alliance || null;
+}
+
+function strategicGroupStartForAlliance(allianceIndex, allianceCount) {
+  if (allianceCount <= 1) return MAP_CENTER;
+  if (allianceCount === 2) return STRATEGIC_GROUP_STARTS[allianceIndex === 0 ? 1 : 2];
+
+  return STRATEGIC_GROUP_STARTS[allianceIndex % STRATEGIC_GROUP_STARTS.length];
+}
+
+function strategicGroupScore(candidate, picked, anchor, allianceIndex, allianceCount) {
+  const anchorDistance = hexDistance(candidate.anchor, anchor);
+  const nearestPicked = picked.reduce(
+    (closest, placement) => Math.min(closest, hexDistance(candidate.anchor, placement.anchor)),
+    Number.POSITIVE_INFINITY,
+  );
+  const cohesion = Number.isFinite(nearestPicked) ? nearestPicked : 0;
+  const laneSoftness = allianceCount > 2 ? angleDifference(laneOrderValue(candidate), angleOrderValue(Math.atan2(anchor.y - MAP_CENTER.y, anchor.x - MAP_CENTER.x))) : 0;
+  const detachedPenalty = picked.length && cohesion > 9 ? (cohesion - 9) * 9000 : 0;
+
+  return (
+    anchorDistance * (picked.length ? 6 : 150) +
+    cohesion * (picked.length ? 520 : 0) +
+    detachedPenalty +
+    laneSoftness * 140 +
+    favorablePlacementScore(candidate) * 12 +
+    candidate.innerDistance * 0.3 +
+    allianceIndex * 0.0001
+  );
 }
 
 function flexibleAllianceTargets(activeAlliances, filledCount) {
@@ -1076,17 +2096,15 @@ function flexibleAllianceTargets(activeAlliances, filledCount) {
 
   if (total < filledCount) {
     let remaining = filledCount - total;
-    for (let index = 0; index < activeAlliances.length && remaining > 0; index += 1) {
-      const alliance = activeAlliances[index];
-      const current = targets.get(alliance.id) || 0;
-      const maximum = alliance.count + ALLIANCE_EXTRA_FLEX;
-      const add = Math.min(remaining, maximum - current);
-      targets.set(alliance.id, current + add);
-      remaining -= add;
-    }
-
-    for (let index = 0; index < activeAlliances.length && remaining > 0; index += 1) {
-      const alliance = activeAlliances[index];
+    while (remaining > 0 && activeAlliances.length) {
+      const alliance = activeAlliances
+        .map((item, index) => ({
+          alliance: item,
+          ratio:
+            ((targets.get(item.id) || 0) + 1) / Math.max(1, item.count) +
+            (index === activeAlliances.length - 1 ? 100 : index * 0.08),
+        }))
+        .sort((a, b) => a.ratio - b.ratio)[0].alliance;
       const current = targets.get(alliance.id) || 0;
       targets.set(alliance.id, current + 1);
       remaining -= 1;
@@ -1441,6 +2459,20 @@ function renderAll() {
   saveState();
 }
 
+function clearGeneratedFill() {
+  assignments = [];
+  enemyOpenCount = 0;
+  renderStats();
+  renderMap();
+  renderLegend();
+  renderAssignmentTable();
+}
+
+function startFreshGeneration() {
+  generationSeed = makeGenerationSeed();
+  state.hqNames = {};
+}
+
 function syncStateFromForm() {
   state.server = serverNumber.value.trim();
   state.spacing = FIXED_SPACING;
@@ -1485,13 +2517,15 @@ function renderAllianceInputs() {
 }
 
 function renderStats() {
-  const assigned = assignments.filter((assignment) => !assignment.shortfall).length;
+  const activeAssignments = assignments.filter((assignment) => !assignment.shortfall);
+  const assigned = activeAssignments.length;
   const requested = requestedTotal();
-  const shortfall = Math.max(0, requested - assigned);
+  const edgePairs = contactEdgeCount(activeAssignments);
   const stats = [
     ["defender-slots", "Defender Slots", maxPlan.length.toLocaleString()],
     ["requested", "Requested", requested.toLocaleString()],
     ["placed", "Placed", assigned.toLocaleString()],
+    ["edge-pairs", "HQ Edge Pairs", edgePairs.toLocaleString()],
     ["enemy-hqs-fit", "Enemy HQs Fit", enemyOpenCount.toLocaleString()],
     ["seal-status", "Seal Status", enemyOpenCount ? "Open" : "Sealed"],
     [
@@ -1575,6 +2609,31 @@ function renderMap() {
     })
     .join("");
 
+  const enemyPlacements = showEnemyPlacements
+    ? enemyPlacementPackForPlacements(activeAssignments, buildPlacementCandidates(0, "enemy"))
+    : [];
+  const enemyTiles = enemyPlacements
+    .flatMap((placement) =>
+      placement.cells.map(
+        (cell) => `<polygon class="enemy-hq-cell" points="${hexPoints(cell.x, cell.y, TILE_RADIUS * 0.9)}"></polygon>`,
+      ),
+    )
+    .join("");
+  const enemyLabels = enemyPlacements
+    .map((placement, index) => {
+      const labelCenter = projectCoordinate(placement.anchor);
+      return `
+        <text
+          class="enemy-hq-label"
+          x="${labelCenter.x.toFixed(2)}"
+          y="${labelCenter.y.toFixed(2)}"
+          text-anchor="middle"
+          dominant-baseline="central"
+        >${index + 1}</text>
+      `;
+    })
+    .join("");
+
   const forbiddenTiles = [...forbiddenSet]
     .map((key) => {
       const [x, y] = key.split(",").map(Number);
@@ -1592,6 +2651,8 @@ function renderMap() {
     ${forbiddenTiles}
     ${tiles}
     ${labels}
+    ${enemyTiles}
+    ${enemyLabels}
     <circle class="capital-dot" cx="${capitalCenter.x.toFixed(2)}" cy="${capitalCenter.y.toFixed(2)}" r="${(TILE_RADIUS * 1.28).toFixed(2)}"></circle>
   `;
 }
@@ -1829,7 +2890,7 @@ function formatShortfallWarning(shortfall) {
   if (qualityTrim) {
     const verb = qualityTrim === 1 ? "was" : "were";
     const additional = shortfall > qualityTrim ? ` ${shortfall - qualityTrim} additional ${hqLabel(shortfall - qualityTrim)} could not fit.` : "";
-    return `${qualityTrim} ${hqLabel(qualityTrim)} ${verb} left unplaced within the -${ALLIANCE_TRIM_FLEX}/+${ALLIANCE_EXTRA_FLEX} alliance flexibility range to keep lanes cleaner.${additional}`;
+    return `${qualityTrim} ${hqLabel(qualityTrim)} ${verb} left unplaced to keep HQ spacing cleaner while preserving the seal.${additional}`;
   }
 
   return `${shortfall} ${hqLabel(shortfall)} could not fit in the current mud shape.`;
@@ -2069,8 +3130,10 @@ function mapExportStyles() {
     .forbidden-cell{fill:rgba(239,106,87,.8);stroke:rgba(10,12,9,.85);stroke-width:.1}
     .outer-hq-cell{fill:rgba(128,136,126,.62);stroke:rgba(10,12,9,.78);stroke-width:.1}
     .hq-cell{opacity:.92;stroke:rgba(10,12,9,.9);stroke-width:.11}
+    .enemy-hq-cell{fill:#050704;opacity:.9;stroke:rgba(242,245,234,.55);stroke-width:.1}
     .capital-dot{fill:#ef6a57;stroke:#fff1d6;stroke-width:.35}
     .hq-label{fill:#091006;stroke:rgba(255,255,255,.42);stroke-width:.065;paint-order:stroke;font:950 1.42px system-ui,sans-serif;pointer-events:none}
+    .enemy-hq-label{fill:#f2f5ea;stroke:rgba(0,0,0,.75);stroke-width:.08;paint-order:stroke;font:950 1.28px system-ui,sans-serif;pointer-events:none}
   `;
 }
 
@@ -2226,6 +3289,21 @@ function makeId() {
   return `alliance-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function makeGenerationSeed() {
+  return Math.floor(Date.now() % 1000000000) + Math.floor(Math.random() * 1000000);
+}
+
+function seededPlacementJitter(candidate, scale = 1) {
+  let hash = generationSeed || 1;
+  const value = `${candidate.id}:${candidate.anchor.x}:${candidate.anchor.y}`;
+
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash * 31 + value.charCodeAt(index)) % 2147483647;
+  }
+
+  return (hash / 2147483647) * scale;
+}
+
 function armMapInteraction() {
   if (mapInteractionArmed) return;
   mapInteractionArmed = true;
@@ -2345,8 +3423,10 @@ function handleAllianceDraftChange(event) {
   const alliance = state.alliances.find((item) => item.id === row.dataset.id);
   if (!alliance) return;
 
+  const previousCount = Number(alliance.count) || 0;
   alliance[field] = field === "count" ? Math.max(0, Number(event.target.value) || 0) : event.target.value;
   renderRequestedStat();
+  if (field === "count" && alliance.count !== previousCount) clearGeneratedFill();
   saveState();
 }
 
@@ -2361,6 +3441,7 @@ allianceList.addEventListener("click", (event) => {
   state.alliances = state.alliances.filter((alliance) => alliance.id !== row.dataset.id);
   renderAllianceInputs();
   renderRequestedStat();
+  clearGeneratedFill();
   saveState();
 });
 
@@ -2368,6 +3449,7 @@ document.querySelector("#add-alliance").addEventListener("click", () => {
   state.alliances.push({ id: makeId(), name: "", count: 1 });
   renderAllianceInputs();
   renderRequestedStat();
+  clearGeneratedFill();
   saveState();
   allianceList.querySelector(".alliance-row:last-child input")?.focus();
 });
@@ -2382,8 +3464,49 @@ document.querySelector("#generate-plan").addEventListener("click", () => {
 
   serverNumber.classList.remove("input-error");
   syncStateFromForm();
+  startFreshGeneration();
   renderAll();
   showToast("Fill map generated");
+});
+
+if (optimizeFurtherButton) optimizeFurtherButton.addEventListener("click", async () => {
+  if (optimizeFurtherButton.disabled) return;
+
+  const durationMs = 30000;
+  const deadline = Date.now() + durationMs;
+  const beforeEdges = contactEdgeCount(assignments.filter((assignment) => !assignment.shortfall));
+  const setCountdown = (seconds) => {
+    setOptimizeButtonText(`Optimizing ${seconds}s`);
+  };
+  const refreshCountdown = () => {
+    setCountdown(Math.max(0, Math.ceil((deadline - Date.now()) / 1000)));
+  };
+  optimizeFurtherButton.disabled = true;
+  refreshCountdown();
+  const countdownTimer = setInterval(refreshCountdown, 250);
+  showToast("Deeper optimization started");
+
+  try {
+    await sleep(60);
+    const optimizedActive = await optimizeActivePlacementsFurther(assignments, {
+      durationMs,
+      onProgress: setCountdown,
+    });
+    assignments = rebalanceAllianceOwnership([...optimizedActive, ...assignments.filter((assignment) => assignment.shortfall)]);
+    enemyOpenCount = countEnemyOpenings(assignments);
+    renderStats();
+    renderMap();
+    renderLegend();
+    renderAssignmentTable();
+    saveState();
+
+    const afterEdges = contactEdgeCount(assignments.filter((assignment) => !assignment.shortfall));
+    showToast(afterEdges < beforeEdges ? `Reduced edge sharing by ${beforeEdges - afterEdges}` : "No cleaner move found");
+  } finally {
+    clearInterval(countdownTimer);
+    optimizeFurtherButton.disabled = false;
+    setOptimizeButtonText("Optimize Further");
+  }
 });
 
 assignmentTable.addEventListener("input", (event) => {
@@ -2418,12 +3541,18 @@ document.querySelector("#copy-coords").addEventListener("click", () => {
   copyText(buildCoordinateText(false), "Coordinates copied");
 });
 
-document.querySelector("#copy-discord").addEventListener("click", () => {
+document.querySelector("#copy-discord")?.addEventListener("click", () => {
   copyText(buildCoordinateText(true));
 });
 
 document.querySelector("#download-map").addEventListener("click", () => {
   downloadMapJpg();
+});
+
+document.querySelector("#toggle-enemy")?.addEventListener("click", (event) => {
+  showEnemyPlacements = !showEnemyPlacements;
+  event.currentTarget.textContent = showEnemyPlacements ? "Hide Enemy Placements" : "Show Enemy Placements";
+  renderMap();
 });
 
 document.querySelector("#download-config").addEventListener("click", () => {

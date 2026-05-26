@@ -249,7 +249,7 @@ input.input-error {
 
 .actions-row {
   display: grid;
-  grid-template-columns: 1fr 1.2fr;
+  grid-template-columns: 1fr 1.2fr 1.25fr;
   gap: 10px;
 }
 
@@ -283,6 +283,12 @@ input.input-error {
   padding: 10px 13px;
 }
 
+.map-toggle-button {
+  width: auto;
+  min-width: 168px;
+  white-space: nowrap;
+}
+
 .icon-button {
   width: 40px;
   height: 40px;
@@ -294,6 +300,11 @@ button:focus-visible {
   border-color: var(--acid);
   outline: none;
   box-shadow: 0 0 0 3px rgba(182, 240, 85, .1);
+}
+
+button:disabled {
+  cursor: wait;
+  opacity: .72;
 }
 
 button svg {
@@ -459,6 +470,23 @@ button svg {
   stroke: rgba(10, 12, 9, .9);
   stroke-width: .11;
   filter: url(#tile-glow);
+}
+
+.enemy-hq-cell {
+  fill: #050704;
+  opacity: .9;
+  stroke: rgba(242, 245, 234, .55);
+  stroke-width: .1;
+}
+
+.enemy-hq-label {
+  fill: #f2f5ea;
+  stroke: rgba(0, 0, 0, .75);
+  stroke-width: .08;
+  paint-order: stroke;
+  font-size: 1.28px;
+  font-weight: 950;
+  pointer-events: none;
 }
 
 .capital-dot {
