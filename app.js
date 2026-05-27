@@ -1921,7 +1921,7 @@ async function fillActiveGaps(currentAssignments, { durationMs = 30000, onProgre
   let lastYield = 0;
   const yieldIfNeeded = async () => {
     const now = Date.now();
-    if (now - lastYield < 140) return;
+    if (now - lastYield < 80) return;
     lastYield = now;
     onProgress(Math.max(0, Math.ceil((deadline - now) / 1000)));
     await sleep(0);
@@ -2068,6 +2068,7 @@ async function polishFilledGapClusters(
 ) {
   let polished = [...plan];
   if (countEnemyOpeningsForPlacements(polished, enemyCandidates) > 0) return polished;
+  const defenseById = new Map(defenseCandidates.map((candidate) => [candidate.id, candidate]));
 
   for (let pass = 0; pass < 10 && Date.now() < deadline; pass += 1) {
     await yieldIfNeeded();
@@ -2085,15 +2086,18 @@ async function polishFilledGapClusters(
     let best = null;
 
     for (const cluster of clusters) {
+      await yieldIfNeeded();
+      const polishedContactCounts = contactCountsForPlacements(polished);
       const members = [...cluster.members].sort(
         (a, b) =>
           Number(Boolean(b.gapFill || b.emergencyGapFill || b.directEnemyBlocker)) -
             Number(Boolean(a.gapFill || a.emergencyGapFill || a.directEnemyBlocker)) ||
-          (contactCountsForPlacements(polished).get(b.id) || 0) - (contactCountsForPlacements(polished).get(a.id) || 0),
+          (polishedContactCounts.get(b.id) || 0) - (polishedContactCounts.get(a.id) || 0),
       );
 
       for (const target of members) {
         if (Date.now() >= deadline) break;
+        await yieldIfNeeded();
 
         const withoutTarget = polished.filter((placement) => placement.id !== target.id);
         const removal = scoreClusterPolishProposal(withoutTarget, enemyCandidates, softClusterSize, hardClusterSize);
@@ -2104,10 +2108,10 @@ async function polishFilledGapClusters(
         const occupied = new Set(withoutTarget.flatMap((placement) => placement.cellKeys));
         const contactCounts = contactCountsForPlacements(withoutTarget);
         const cellIndex = placementCellIndex(withoutTarget);
-        const localCandidates = nearbyCandidateAnchors(target.anchor, 3)
-          .map((anchor) => defenseCandidates.find((candidate) => candidate.id === pointKey(anchor)))
+        const localCandidates = nearbyCandidateAnchors(target.anchor, 4)
+          .map((anchor) => defenseById.get(pointKey(anchor)))
           .filter(Boolean);
-        const options = uniqueCandidates(localCandidates, defenseCandidates)
+        const options = localCandidates
           .filter((candidate) => candidate.id !== target.id)
           .filter((candidate) => !candidate.cellKeys.some((key) => occupied.has(key)))
           .filter((candidate) => !wouldExceedContactCluster(candidate, withoutTarget, hardClusterSize, contactCounts, cellIndex))
@@ -2118,11 +2122,12 @@ async function polishFilledGapClusters(
               contactEdgeCount([...withoutTarget, a]) - contactEdgeCount([...withoutTarget, b]) ||
               coverageCandidateScore(a, withoutTarget) - coverageCandidateScore(b, withoutTarget),
           )
-          .slice(0, 90);
+          .slice(0, 45);
 
         for (const candidate of options) {
+          await yieldIfNeeded();
           let proposal = [...withoutTarget, { ...target, ...candidate, flexAdjusted: true, clusterPolish: true }];
-          proposal = pruneRedundantSealedPlacements(proposal, enemyCandidates, hardClusterSize);
+          proposal = await pruneRedundantSealedPlacements(proposal, enemyCandidates, hardClusterSize, yieldIfNeeded);
           const scored = scoreClusterPolishProposal(proposal, enemyCandidates, softClusterSize, hardClusterSize);
           if (!scored || scored.score >= currentScore) continue;
           if (!best || scored.score < best.score) best = { proposal, score: scored.score };
@@ -2137,20 +2142,28 @@ async function polishFilledGapClusters(
   return polished;
 }
 
-function pruneRedundantSealedPlacements(placements, enemyCandidates, hardClusterSize = 4) {
+async function pruneRedundantSealedPlacements(
+  placements,
+  enemyCandidates,
+  hardClusterSize = 4,
+  yieldIfNeeded = async () => {},
+) {
   let pruned = [...placements];
   let changed = true;
 
-  while (changed) {
+  for (let pass = 0; changed && pass < 8; pass += 1) {
+    await yieldIfNeeded();
     changed = false;
+    const contactCounts = contactCountsForPlacements(pruned);
     const removalOrder = [...pruned].sort(
       (a, b) =>
         Number(Boolean(b.gapFill || b.emergencyGapFill || b.directEnemyBlocker || b.clusterPolish)) -
           Number(Boolean(a.gapFill || a.emergencyGapFill || a.directEnemyBlocker || a.clusterPolish)) ||
-        (contactCountsForPlacements(pruned).get(b.id) || 0) - (contactCountsForPlacements(pruned).get(a.id) || 0),
+        (contactCounts.get(b.id) || 0) - (contactCounts.get(a.id) || 0),
     );
 
     for (const placement of removalOrder) {
+      await yieldIfNeeded();
       const proposal = pruned.filter((item) => item.id !== placement.id);
       if (countEnemyOpeningsForPlacements(proposal, enemyCandidates) > 0) continue;
       if (contactClusterStats(proposal, hardClusterSize).excess > 0) continue;
@@ -2184,18 +2197,21 @@ async function slideRemainingEnemyGapsDirectly(
     let best = null;
 
     for (const enemy of visibleEnemyPack) {
+      await yieldIfNeeded();
       const enemyCellKeys = new Set(enemy.cellKeys);
+      const repairedContactCounts = contactCountsForPlacements(repaired);
       const movers = repaired
         .map((placement) => ({
           placement,
           distance: nearestDistanceToGroup(placement, [enemy]),
-          contactCount: contactCountsForPlacements(repaired).get(placement.id) || 0,
+          contactCount: repairedContactCounts.get(placement.id) || 0,
         }))
         .filter(({ distance }) => distance <= 8)
         .sort((a, b) => a.distance - b.distance || b.contactCount - a.contactCount)
         .slice(0, 24);
 
       for (const { placement } of movers) {
+        await yieldIfNeeded();
         const withoutPlacement = repaired.filter((item) => item.id !== placement.id);
         const occupied = new Set(withoutPlacement.flatMap((item) => item.cellKeys));
         const contactCounts = contactCountsForPlacements(withoutPlacement);
@@ -2209,6 +2225,7 @@ async function slideRemainingEnemyGapsDirectly(
           .filter((candidate) => !wouldExceedContactCluster(candidate, withoutPlacement, maxClusterSize, contactCounts, cellIndex));
 
         for (const candidate of options) {
+          await yieldIfNeeded();
           const proposal = [...withoutPlacement, { ...placement, ...candidate, flexAdjusted: true, directGapSlide: true }];
           if (!isEnemyCandidateBlocked(enemy, proposal)) continue;
           const nextOpen = countEnemyOpeningsForPlacements(proposal, enemyCandidates);
@@ -2287,6 +2304,7 @@ async function forceFillRemainingEnemyGaps(
     let best = null;
 
     for (const enemy of visibleEnemyPack) {
+      await yieldIfNeeded();
       if (enemy.cellKeys.some((key) => occupied.has(key))) continue;
 
       let proposal = [...filled, { ...enemy, flexAdjusted: true, gapFill: true, emergencyGapFill: true }];
@@ -2366,6 +2384,7 @@ async function addGapFillPlacements(
 
     for (const { candidate, blockedVisible, visibleCells, touchCount } of options) {
       if (Date.now() >= deadline) break;
+      await yieldIfNeeded();
       let proposal = [...filled, { ...candidate, flexAdjusted: true, gapFill: true }];
       let contact = contactClusterStats(proposal, maxClusterSize);
       if (contact.excess) {
@@ -2424,6 +2443,7 @@ async function findDirectEnemyBlockerPlacement(
 
   for (const enemy of visibleEnemyPack) {
     if (Date.now() >= deadline) break;
+    await yieldIfNeeded();
     if (enemy.cellKeys.some((key) => occupied.has(key))) continue;
 
     let proposal = [...filled, { ...enemy, flexAdjusted: true, gapFill: true, directEnemyBlocker: true }];
@@ -2459,8 +2479,10 @@ async function reduceContactClustersBySliding(
 ) {
   let repaired = [...plan];
   let baselineOpen = countEnemyOpeningsForPlacements(repaired, enemyCandidates);
+  const candidatesById = new Map(defenseCandidates.map((candidate) => [candidate.id, candidate]));
 
   for (let pass = 0; pass < 4 && Date.now() < deadline; pass += 1) {
+    await yieldIfNeeded();
     const oversized = contactClusters(repaired).filter((cluster) => cluster.members.length > maxClusterSize);
     if (!oversized.length) break;
 
@@ -2469,32 +2491,38 @@ async function reduceContactClustersBySliding(
       if (Date.now() >= deadline) break;
       await yieldIfNeeded();
 
+      const repairedContactCounts = contactCountsForPlacements(repaired);
       const movers = [...cluster.members].sort(
         (a, b) =>
           Number(Boolean(b.gapFill || b.directEnemyBlocker)) - Number(Boolean(a.gapFill || a.directEnemyBlocker)) ||
-          (contactCountsForPlacements(repaired).get(b.id) || 0) - (contactCountsForPlacements(repaired).get(a.id) || 0),
+          (repairedContactCounts.get(b.id) || 0) - (repairedContactCounts.get(a.id) || 0),
       );
 
       for (const target of movers) {
+        await yieldIfNeeded();
         const withoutTarget = repaired.filter((placement) => placement.id !== target.id);
         const occupied = new Set(withoutTarget.flatMap((placement) => placement.cellKeys));
         const contactCounts = contactCountsForPlacements(withoutTarget);
         const cellIndex = placementCellIndex(withoutTarget);
-        const options = defenseCandidates
-          .filter((candidate) => candidate.id !== target.id)
-          .filter((candidate) => hexDistance(candidate.anchor, target.anchor) <= maxMoveDistance)
+        const options = nearbyCandidateAnchors(target.anchor, maxMoveDistance)
+          .map((anchor) => candidatesById.get(pointKey(anchor)))
+          .filter(Boolean)
           .filter((candidate) => !candidate.cellKeys.some((key) => occupied.has(key)))
           .filter((candidate) => !wouldExceedContactCluster(candidate, withoutTarget, maxClusterSize, contactCounts, cellIndex))
-          .sort(
-            (a, b) =>
-              countEnemyOpeningsForPlacements([...withoutTarget, { ...target, ...a }], enemyCandidates) -
-                countEnemyOpeningsForPlacements([...withoutTarget, { ...target, ...b }], enemyCandidates) ||
-              hexDistance(a.anchor, target.anchor) - hexDistance(b.anchor, target.anchor) ||
-              coverageCandidateScore(a, withoutTarget) - coverageCandidateScore(b, withoutTarget),
-          )
+          .map((candidate) => {
+            const proposal = [...withoutTarget, { ...target, ...candidate }];
+            return {
+              candidate,
+              open: countEnemyOpeningsForPlacements(proposal, enemyCandidates),
+              distance: hexDistance(candidate.anchor, target.anchor),
+              coverage: coverageCandidateScore(candidate, withoutTarget),
+            };
+          })
+          .sort((a, b) => a.open - b.open || a.distance - b.distance || a.coverage - b.coverage)
           .slice(0, 24);
 
-        for (const candidate of options) {
+        for (const { candidate } of options) {
+          await yieldIfNeeded();
           const proposal = [...withoutTarget, { ...target, ...candidate, flexAdjusted: true, clusterRelief: true }];
           const contact = contactClusterStats(proposal, maxClusterSize);
           if (contact.excess) continue;
@@ -2822,7 +2850,8 @@ function assignStrategicAllianceGroups(activeAlliances, activePlacements, target
   });
 
   const mergedGroups = mergeDetachedAllianceComponents(placementsByAlliance, activeAlliances);
-  return rebalancePriorityPlacementCounts(mergedGroups, activeAlliances, targets);
+  const priorityGroups = rebalancePriorityPlacementCounts(mergedGroups, activeAlliances, targets);
+  return mergeDetachedAllianceComponents(priorityGroups, activeAlliances);
 }
 
 function rebalancePriorityPlacementCounts(placementsByAlliance, activeAlliances, targets) {
@@ -2895,23 +2924,16 @@ function mergeDetachedAllianceComponents(placementsByAlliance, activeAlliances) 
       if (components.length <= 1) return;
 
       const keep = components[0];
-      const detached = components.slice(1).flat();
       placementsByAlliance.set(alliance.id, keep);
 
-      detached.forEach((placement) => {
-        const swapped = trySwapDetachedPlacement(placement, alliance, activeAlliances, placementsByAlliance);
-        if (swapped) {
-          moved = true;
-          return;
-        }
-
-        const targetAlliance = nearestAllianceGroupForPlacement(placement, activeAlliances, placementsByAlliance, alliance.id);
+      components.slice(1).forEach((component) => {
+        const targetAlliance = nearestAllianceGroupForComponent(component, activeAlliances, placementsByAlliance, alliance.id);
         if (!targetAlliance) {
-          keep.push(placement);
+          keep.push(...component);
           return;
         }
 
-        placementsByAlliance.get(targetAlliance.id).push(placement);
+        placementsByAlliance.get(targetAlliance.id).push(...component);
         moved = true;
       });
     });
@@ -2975,7 +2997,7 @@ function nearestDistanceToGroup(placement, group) {
   );
 }
 
-function alliancePlacementComponents(placements, maxGap = 11) {
+function alliancePlacementComponents(placements, maxGap = 8) {
   const visited = new Set();
   const components = [];
 
@@ -3002,6 +3024,30 @@ function alliancePlacementComponents(placements, maxGap = 11) {
   });
 
   return components.sort((a, b) => b.length - a.length);
+}
+
+function nearestAllianceGroupForComponent(component, activeAlliances, placementsByAlliance, sourceAllianceId) {
+  return activeAlliances
+    .filter((alliance) => alliance.id !== sourceAllianceId)
+    .map((alliance) => {
+      const group = placementsByAlliance.get(alliance.id) || [];
+      const nearest = component.reduce(
+        (closest, placement) => Math.min(closest, nearestDistanceToGroup(placement, group)),
+        Number.POSITIVE_INFINITY,
+      );
+      const allianceIndex = activeAlliances.findIndex((item) => item.id === alliance.id);
+      const anchor = strategicGroupStartForAlliance(allianceIndex, activeAlliances.length);
+      const center = averageAnchor(component);
+      return {
+        alliance,
+        score:
+          (Number.isFinite(nearest) ? nearest : 80) * 180 +
+          hexDistance(center, anchor) * 10 +
+          component.length * -2 +
+          allianceIndex * 0.001,
+      };
+    })
+    .sort((a, b) => a.score - b.score)[0]?.alliance || null;
 }
 
 function nearestAllianceGroupForPlacement(placement, activeAlliances, placementsByAlliance, sourceAllianceId) {
@@ -3041,7 +3087,7 @@ function strategicGroupScore(candidate, picked, anchor, allianceIndex, allianceC
   );
   const cohesion = Number.isFinite(nearestPicked) ? nearestPicked : 0;
   const laneSoftness = allianceCount > 2 ? angleDifference(laneOrderValue(candidate), angleOrderValue(Math.atan2(anchor.y - MAP_CENTER.y, anchor.x - MAP_CENTER.x))) : 0;
-  const detachedPenalty = picked.length && cohesion > 9 ? (cohesion - 9) * 9000 : 0;
+  const detachedPenalty = picked.length && cohesion > 8 ? (cohesion - 8) * 14000 : 0;
 
   return (
     anchorDistance * (picked.length ? 6 : 150) +
@@ -4521,7 +4567,7 @@ if (fillGapsButton) fillGapsButton.addEventListener("click", async () => {
   const deadline = Date.now() + durationMs;
   const beforeOpen = countEnemyOpenings(assignments);
   const setCountdown = (seconds) => {
-    setFillGapsButtonText(`Filling ${seconds}s`);
+    setFillGapsButtonText(seconds > 0 ? `Filling ${seconds}s` : "Finalizing");
   };
   const refreshCountdown = () => {
     setCountdown(Math.max(0, Math.ceil((deadline - Date.now()) / 1000)));
