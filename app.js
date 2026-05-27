@@ -1994,6 +1994,20 @@ async function fillActiveGaps(currentAssignments, { durationMs = 30000, onProgre
   }
 
   if (baselineOpen > 0) {
+    const directSlide = await slideRemainingEnemyGapsDirectly(activePlacements, enemyCandidates, gapFillCandidates, {
+      maxClusterSize: 4,
+      maxMoveDistance: 2,
+      deadline: Math.max(deadline, Date.now() + 6000),
+      yieldIfNeeded,
+    });
+    const directSlideOpen = countEnemyOpeningsForPlacements(directSlide, enemyCandidates);
+    if (directSlideOpen <= baselineOpen && placementAnchorSignature(directSlide) !== placementAnchorSignature(activePlacements)) {
+      activePlacements = directSlide;
+      baselineOpen = directSlideOpen;
+    }
+  }
+
+  if (baselineOpen > 0) {
     const emergencyDeadline = Math.max(deadline, Date.now() + 6000);
     const clusterSafeFill = await forceFillRemainingEnemyGaps(activePlacements, enemyCandidates, gapFillCandidates, {
       maxClusterSize: 3,
@@ -2009,15 +2023,248 @@ async function fillActiveGaps(currentAssignments, { durationMs = 30000, onProgre
   }
 
   if (baselineOpen > 0) {
+    const cappedFill = await forceFillRemainingEnemyGaps(activePlacements, enemyCandidates, gapFillCandidates, {
+      maxClusterSize: 4,
+      allowOversizedClusters: false,
+      deadline: Math.max(deadline, Date.now() + 6000),
+      yieldIfNeeded,
+    });
+    const cappedOpen = countEnemyOpeningsForPlacements(cappedFill, enemyCandidates);
+    if (cappedOpen < baselineOpen) {
+      activePlacements = cappedFill;
+      baselineOpen = cappedOpen;
+    }
+  }
+
+  if (baselineOpen > 0) {
     activePlacements = await forceFillRemainingEnemyGaps(activePlacements, enemyCandidates, gapFillCandidates, {
-      maxClusterSize: 3,
+      maxClusterSize: 4,
       allowOversizedClusters: true,
       deadline: Math.max(deadline, Date.now() + 6000),
       yieldIfNeeded,
     });
   }
 
+  activePlacements = await polishFilledGapClusters(activePlacements, enemyCandidates, gapFillCandidates, {
+    softClusterSize: 3,
+    hardClusterSize: 4,
+    deadline: Math.max(deadline, Date.now() + 8000),
+    yieldIfNeeded,
+  });
+
   return activePlacements;
+}
+
+async function polishFilledGapClusters(
+  plan,
+  enemyCandidates,
+  defenseCandidates,
+  {
+    softClusterSize = 3,
+    hardClusterSize = 4,
+    deadline = Number.POSITIVE_INFINITY,
+    yieldIfNeeded = async () => {},
+  } = {},
+) {
+  let polished = [...plan];
+  if (countEnemyOpeningsForPlacements(polished, enemyCandidates) > 0) return polished;
+
+  for (let pass = 0; pass < 10 && Date.now() < deadline; pass += 1) {
+    await yieldIfNeeded();
+    const clusters = contactClusters(polished)
+      .filter((cluster) => cluster.members.length > 1)
+      .sort(
+        (a, b) =>
+          Number(b.members.length > softClusterSize) - Number(a.members.length > softClusterSize) ||
+          b.members.length - a.members.length ||
+          b.edgeCount - a.edgeCount,
+      );
+    if (!clusters.length) break;
+
+    const currentScore = clusterPolishScore(polished, enemyCandidates, softClusterSize, hardClusterSize);
+    let best = null;
+
+    for (const cluster of clusters) {
+      const members = [...cluster.members].sort(
+        (a, b) =>
+          Number(Boolean(b.gapFill || b.emergencyGapFill || b.directEnemyBlocker)) -
+            Number(Boolean(a.gapFill || a.emergencyGapFill || a.directEnemyBlocker)) ||
+          (contactCountsForPlacements(polished).get(b.id) || 0) - (contactCountsForPlacements(polished).get(a.id) || 0),
+      );
+
+      for (const target of members) {
+        if (Date.now() >= deadline) break;
+
+        const withoutTarget = polished.filter((placement) => placement.id !== target.id);
+        const removal = scoreClusterPolishProposal(withoutTarget, enemyCandidates, softClusterSize, hardClusterSize);
+        if (removal && removal.score < currentScore && (!best || removal.score < best.score)) {
+          best = { proposal: withoutTarget, score: removal.score };
+        }
+
+        const occupied = new Set(withoutTarget.flatMap((placement) => placement.cellKeys));
+        const contactCounts = contactCountsForPlacements(withoutTarget);
+        const cellIndex = placementCellIndex(withoutTarget);
+        const localCandidates = nearbyCandidateAnchors(target.anchor, 3)
+          .map((anchor) => defenseCandidates.find((candidate) => candidate.id === pointKey(anchor)))
+          .filter(Boolean);
+        const options = uniqueCandidates(localCandidates, defenseCandidates)
+          .filter((candidate) => candidate.id !== target.id)
+          .filter((candidate) => !candidate.cellKeys.some((key) => occupied.has(key)))
+          .filter((candidate) => !wouldExceedContactCluster(candidate, withoutTarget, hardClusterSize, contactCounts, cellIndex))
+          .sort(
+            (a, b) =>
+              touchedPlacements(a, withoutTarget, cellIndex).length - touchedPlacements(b, withoutTarget, cellIndex).length ||
+              hexDistance(a.anchor, target.anchor) - hexDistance(b.anchor, target.anchor) ||
+              contactEdgeCount([...withoutTarget, a]) - contactEdgeCount([...withoutTarget, b]) ||
+              coverageCandidateScore(a, withoutTarget) - coverageCandidateScore(b, withoutTarget),
+          )
+          .slice(0, 90);
+
+        for (const candidate of options) {
+          let proposal = [...withoutTarget, { ...target, ...candidate, flexAdjusted: true, clusterPolish: true }];
+          proposal = pruneRedundantSealedPlacements(proposal, enemyCandidates, hardClusterSize);
+          const scored = scoreClusterPolishProposal(proposal, enemyCandidates, softClusterSize, hardClusterSize);
+          if (!scored || scored.score >= currentScore) continue;
+          if (!best || scored.score < best.score) best = { proposal, score: scored.score };
+        }
+      }
+    }
+
+    if (!best) break;
+    polished = best.proposal;
+  }
+
+  return polished;
+}
+
+function pruneRedundantSealedPlacements(placements, enemyCandidates, hardClusterSize = 4) {
+  let pruned = [...placements];
+  let changed = true;
+
+  while (changed) {
+    changed = false;
+    const removalOrder = [...pruned].sort(
+      (a, b) =>
+        Number(Boolean(b.gapFill || b.emergencyGapFill || b.directEnemyBlocker || b.clusterPolish)) -
+          Number(Boolean(a.gapFill || a.emergencyGapFill || a.directEnemyBlocker || a.clusterPolish)) ||
+        (contactCountsForPlacements(pruned).get(b.id) || 0) - (contactCountsForPlacements(pruned).get(a.id) || 0),
+    );
+
+    for (const placement of removalOrder) {
+      const proposal = pruned.filter((item) => item.id !== placement.id);
+      if (countEnemyOpeningsForPlacements(proposal, enemyCandidates) > 0) continue;
+      if (contactClusterStats(proposal, hardClusterSize).excess > 0) continue;
+      pruned = proposal;
+      changed = true;
+      break;
+    }
+  }
+
+  return pruned;
+}
+
+async function slideRemainingEnemyGapsDirectly(
+  plan,
+  enemyCandidates,
+  defenseCandidates,
+  {
+    maxClusterSize = 4,
+    maxMoveDistance = 2,
+    deadline = Number.POSITIVE_INFINITY,
+    yieldIfNeeded = async () => {},
+  } = {},
+) {
+  let repaired = [...plan];
+  let baselineOpen = countEnemyOpeningsForPlacements(repaired, enemyCandidates);
+  const candidatesById = new Map(defenseCandidates.map((candidate) => [candidate.id, candidate]));
+
+  for (let pass = 0; pass < 8 && baselineOpen > 0 && Date.now() < deadline; pass += 1) {
+    await yieldIfNeeded();
+    const visibleEnemyPack = enemyPlacementPackForPlacements(repaired, enemyCandidates);
+    let best = null;
+
+    for (const enemy of visibleEnemyPack) {
+      const enemyCellKeys = new Set(enemy.cellKeys);
+      const movers = repaired
+        .map((placement) => ({
+          placement,
+          distance: nearestDistanceToGroup(placement, [enemy]),
+          contactCount: contactCountsForPlacements(repaired).get(placement.id) || 0,
+        }))
+        .filter(({ distance }) => distance <= 8)
+        .sort((a, b) => a.distance - b.distance || b.contactCount - a.contactCount)
+        .slice(0, 24);
+
+      for (const { placement } of movers) {
+        const withoutPlacement = repaired.filter((item) => item.id !== placement.id);
+        const occupied = new Set(withoutPlacement.flatMap((item) => item.cellKeys));
+        const contactCounts = contactCountsForPlacements(withoutPlacement);
+        const cellIndex = placementCellIndex(withoutPlacement);
+        const options = nearbyCandidateAnchors(placement.anchor, maxMoveDistance)
+          .map((anchor) => candidatesById.get(pointKey(anchor)))
+          .filter(Boolean)
+          .filter((candidate) => candidate.id !== placement.id)
+          .filter((candidate) => candidate.cellKeys.some((key) => enemyCellKeys.has(key)))
+          .filter((candidate) => !candidate.cellKeys.some((key) => occupied.has(key)))
+          .filter((candidate) => !wouldExceedContactCluster(candidate, withoutPlacement, maxClusterSize, contactCounts, cellIndex));
+
+        for (const candidate of options) {
+          const proposal = [...withoutPlacement, { ...placement, ...candidate, flexAdjusted: true, directGapSlide: true }];
+          if (!isEnemyCandidateBlocked(enemy, proposal)) continue;
+          const nextOpen = countEnemyOpeningsForPlacements(proposal, enemyCandidates);
+          if (nextOpen > baselineOpen) continue;
+          const score =
+            nextOpen * 10000000 +
+            contactClusterStats(proposal, maxClusterSize).largest * 500000 +
+            contactEdgeCount(proposal) * 100000 +
+            hexDistance(candidate.anchor, placement.anchor) * 1000 +
+            planLayoutPenalty(proposal);
+          if (!best || score < best.score) best = { proposal, nextOpen, score };
+        }
+      }
+    }
+
+    if (!best) break;
+    repaired = best.proposal;
+    baselineOpen = best.nextOpen;
+  }
+
+  return repaired;
+}
+
+function nearbyCandidateAnchors(anchor, maxDistance) {
+  const anchors = [];
+
+  for (let y = anchor.y - maxDistance; y <= anchor.y + maxDistance; y += 1) {
+    for (let x = anchor.x - maxDistance; x <= anchor.x + maxDistance; x += 1) {
+      const candidate = { x, y };
+      if (hexDistance(anchor, candidate) <= maxDistance) anchors.push(candidate);
+    }
+  }
+
+  return anchors;
+}
+
+function scoreClusterPolishProposal(proposal, enemyCandidates, softClusterSize, hardClusterSize) {
+  if (countEnemyOpeningsForPlacements(proposal, enemyCandidates) > 0) return null;
+  return {
+    score: clusterPolishScore(proposal, enemyCandidates, softClusterSize, hardClusterSize),
+  };
+}
+
+function clusterPolishScore(placements, enemyCandidates, softClusterSize, hardClusterSize) {
+  const softStats = contactClusterStats(placements, softClusterSize);
+  const hardStats = contactClusterStats(placements, hardClusterSize);
+  return (
+    countEnemyOpeningsForPlacements(placements, enemyCandidates) * 100000000 +
+    hardStats.excess * 50000000 +
+    Math.max(0, hardStats.largest - hardClusterSize) * 12000000 +
+    softStats.excess * 2500000 +
+    softStats.largest * 260000 +
+    contactEdgeCount(placements) * 120000 +
+    placements.length * 45000 +
+    planLayoutPenalty(placements)
+  );
 }
 
 async function forceFillRemainingEnemyGaps(
