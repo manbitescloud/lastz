@@ -48,6 +48,7 @@ const EXTRA_FORBIDDEN = [
 const FIXED_SPACING = 1;
 const ALLIANCE_EXTRA_FLEX = Number.POSITIVE_INFINITY;
 const ALLIANCE_TRIM_FLEX = Number.POSITIVE_INFINITY;
+const REQUESTED_TOTAL_FLEX = 10;
 const MAX_CONTACT_CLUSTER_SIZE = 2;
 const PLAN_SPACING_OPTIONS = [1];
 const KNOWN_STRONG_GENERATION_SEEDS = [
@@ -56,6 +57,202 @@ const KNOWN_STRONG_GENERATION_SEEDS = [
   908422642,
   909031229,
   909630031,
+];
+const KNOWN_SEALED_BLUEPRINT_ANCHORS = [
+  "467,495",
+  "467,500",
+  "469,502",
+  "470,494",
+  "470,498",
+  "470,506",
+  "470,510",
+  "472,490",
+  "472,503",
+  "472,511",
+  "473,495",
+  "473,500",
+  "473,507",
+  "474,486",
+  "474,515",
+  "474,518",
+  "475,491",
+  "476,482",
+  "476,499",
+  "476,503",
+  "476,511",
+  "477,487",
+  "477,495",
+  "477,507",
+  "477,520",
+  "478,478",
+  "478,516",
+  "478,524",
+  "479,483",
+  "479,491",
+  "480,471",
+  "480,475",
+  "480,500",
+  "480,512",
+  "480,519",
+  "480,523",
+  "480,527",
+  "480,530",
+  "481,480",
+  "481,488",
+  "481,496",
+  "481,504",
+  "481,508",
+  "482,515",
+  "483,468",
+  "483,477",
+  "483,485",
+  "483,493",
+  "483,511",
+  "483,525",
+  "483,529",
+  "483,533",
+  "484,473",
+  "484,481",
+  "484,489",
+  "484,507",
+  "484,520",
+  "486,466",
+  "486,469",
+  "486,516",
+  "486,523",
+  "486,527",
+  "486,531",
+  "487,478",
+  "487,486",
+  "487,512",
+  "487,534",
+  "488,474",
+  "488,482",
+  "488,518",
+  "489,467",
+  "490,471",
+  "490,479",
+  "490,521",
+  "490,525",
+  "490,529",
+  "490,533",
+  "491,475",
+  "493,467",
+  "493,531",
+  "494,471",
+  "494,479",
+  "494,523",
+  "494,527",
+  "495,474",
+  "495,534",
+  "497,467",
+  "497,481",
+  "497,520",
+  "497,525",
+  "497,530",
+  "498,471",
+  "498,476",
+  "499,519",
+  "499,533",
+  "500,523",
+  "500,528",
+  "501,466",
+  "501,475",
+  "501,479",
+  "502,470",
+  "503,481",
+  "503,519",
+  "503,527",
+  "503,532",
+  "504,523",
+  "505,467",
+  "505,472",
+  "505,477",
+  "505,533",
+  "506,529",
+  "507,480",
+  "507,520",
+  "507,525",
+  "508,465",
+  "508,470",
+  "509,474",
+  "509,531",
+  "510,467",
+  "510,478",
+  "510,482",
+  "510,518",
+  "510,522",
+  "510,527",
+  "510,534",
+  "511,471",
+  "512,475",
+  "513,479",
+  "513,484",
+  "513,488",
+  "513,511",
+  "513,515",
+  "513,524",
+  "513,532",
+  "514,467",
+  "514,520",
+  "514,528",
+  "515,472",
+  "516,465",
+  "516,476",
+  "516,482",
+  "516,486",
+  "516,490",
+  "516,494",
+  "516,525",
+  "517,469",
+  "517,504",
+  "517,508",
+  "517,512",
+  "517,516",
+  "517,521",
+  "517,530",
+  "517,534",
+  "518,473",
+  "518,479",
+  "519,483",
+  "519,488",
+  "519,492",
+  "519,496",
+  "519,501",
+  "519,527",
+  "520,506",
+  "520,510",
+  "520,514",
+  "520,518",
+  "520,523",
+  "521,476",
+  "522,480",
+  "522,486",
+  "522,490",
+  "522,494",
+  "522,498",
+  "522,503",
+  "523,508",
+  "523,512",
+  "523,520",
+  "524,483",
+  "524,516",
+  "525,487",
+  "525,492",
+  "525,496",
+  "525,500",
+  "525,505",
+  "526,514",
+  "527,510",
+  "528,490",
+  "528,494",
+  "528,498",
+  "528,502",
+  "528,507",
+  "530,491",
+  "531,496",
+  "531,504",
+  "532,500",
 ];
 const KNOWN_GOOD_STANDALONE_ANCHORS = [
   { x: 467, y: 499 },
@@ -3540,6 +3737,42 @@ function buildGeneratedFillResult(seed = makeGenerationSeed()) {
   };
 }
 
+function buildKnownSealedBlueprintResult() {
+  const requestedGap = Math.abs(requestedTotal() - KNOWN_SEALED_BLUEPRINT_ANCHORS.length);
+  const closeEnough = requestedGap <= REQUESTED_TOTAL_FLEX;
+  if (!closeEnough) return null;
+
+  outerSupportPlan = buildOuterSupportHqs();
+  const enemyCandidates = buildPlacementCandidates(0, "enemy");
+  enemyCandidateCount = enemyCandidates.length;
+  const blueprintCandidates = uniqueCandidates(
+    buildPlacementCandidates(FIXED_SPACING, "defense"),
+    buildPlacementCandidates(FIXED_SPACING, "outer-defense"),
+    buildPlacementCandidates(0, "enemy"),
+  );
+  const candidateById = new Map(blueprintCandidates.map((candidate) => [candidate.id, candidate]));
+  const blueprintPlan = sortFillOrder(
+    KNOWN_SEALED_BLUEPRINT_ANCHORS
+      .map((id) => candidateById.get(id))
+      .filter(Boolean)
+      .map((candidate) => ({ ...candidate, optimizedBlueprint: true })),
+  );
+
+  if (blueprintPlan.length < KNOWN_SEALED_BLUEPRINT_ANCHORS.length * 0.98) return null;
+
+  maxPlan = blueprintPlan.map((placement) => ({ ...placement }));
+  const candidateAssignments = rebalanceAllianceOwnership(blueprintPlan);
+
+  return {
+    seed: KNOWN_STRONG_GENERATION_SEEDS[0],
+    maxPlan: maxPlan.map((placement) => ({ ...placement })),
+    assignments: candidateAssignments.map((assignment) => ({ ...assignment })),
+    enemyOpenCount: countEnemyOpenings(candidateAssignments),
+    enemyCandidateCount,
+    outerSupportPlan: outerSupportPlan.map((placement) => ({ ...placement })),
+  };
+}
+
 function applyGeneratedFillResult(result, { renderInputs = false } = {}) {
   generationSeed = result.seed;
   maxPlan = result.maxPlan.map((placement) => ({ ...placement }));
@@ -3556,18 +3789,21 @@ function applyGeneratedFillResult(result, { renderInputs = false } = {}) {
   saveState();
 }
 
-async function generateBestFill({ attempts = 5, onProgress = () => {} } = {}) {
+async function generateBestFill({ attempts = 3, onProgress = () => {} } = {}) {
   state.hqNames = {};
   let best = null;
-  const seeds = [
-    ...KNOWN_STRONG_GENERATION_SEEDS,
-    ...Array.from({ length: attempts }, () => makeGenerationSeed()),
-  ];
+  const blueprintResult = buildKnownSealedBlueprintResult();
+  const seedCount = blueprintResult ? attempts - 1 : attempts;
+  const candidateRuns = [
+    ...(blueprintResult ? [() => blueprintResult] : []),
+    () => buildGeneratedFillResult(KNOWN_STRONG_GENERATION_SEEDS[0]),
+    ...Array.from({ length: Math.max(0, seedCount - 1) }, () => () => buildGeneratedFillResult(makeGenerationSeed())),
+  ].slice(0, attempts);
 
-  for (let attempt = 0; attempt < seeds.length; attempt += 1) {
-    onProgress(attempt + 1, seeds.length);
+  for (let attempt = 0; attempt < candidateRuns.length; attempt += 1) {
+    onProgress(attempt + 1, candidateRuns.length);
     await sleep(0);
-    const result = buildGeneratedFillResult(seeds[attempt]);
+    const result = candidateRuns[attempt]();
     if (!best || compareGeneratedFillResults(result, best) < 0) best = result;
     await sleep(0);
   }
@@ -3583,12 +3819,16 @@ function generatedFillScore(result) {
   const activePlacements = result.assignments.filter((assignment) => !assignment.shortfall);
   const contact = contactClusterStats(activePlacements, 4);
   const requestedGap = Math.abs(requestedTotal() - activePlacements.length);
-  const closeToRequested = requestedGap <= Math.max(12, Math.round(activePlacements.length * 0.12));
+  const outsideRequestedFlex = requestedGap > REQUESTED_TOTAL_FLEX ? 1 : 0;
+  const closeToRequested = !outsideRequestedFlex;
   const strongSeedPreference = closeToRequested && KNOWN_STRONG_GENERATION_SEEDS.includes(result.seed) ? 0 : 1;
 
   return [
+    outsideRequestedFlex,
+    outsideRequestedFlex ? requestedGap : 0,
     result.enemyOpenCount,
     strongSeedPreference,
+    requestedGap,
     activePlacements.length,
     contact.excess,
     contact.largest,
@@ -4620,7 +4860,7 @@ generatePlanButton.addEventListener("click", async () => {
 
   try {
     const best = await generateBestFill({
-      attempts: 5,
+      attempts: 3,
       onProgress: (attempt, attempts) => setGenerateButtonText(`Generating ${attempt}/${attempts}`),
     });
     applyGeneratedFillResult(best, { renderInputs: true });
