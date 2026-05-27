@@ -152,11 +152,25 @@ const toast = document.querySelector("#toast");
 const capitalImage = document.querySelector("#capital-image");
 const configFileInput = document.querySelector("#config-file");
 const downloadFallback = document.querySelector("#download-fallback");
+const generatePlanButton = document.querySelector("#generate-plan");
+const generateLabel = document.querySelector("#generate-label");
 const optimizeFurtherButton = document.querySelector("#optimize-further");
 const optimizeLabel = document.querySelector("#optimize-label");
 const fillGapsButton = document.querySelector("#fill-gaps");
 const fillGapsLabel = document.querySelector("#fill-gaps-label");
 let downloadFallbackUrl = "";
+
+function setGenerateButtonText(text) {
+  const liveLabel = document.querySelector("#generate-label");
+  if (liveLabel) {
+    liveLabel.textContent = text;
+    return;
+  }
+
+  if (generatePlanButton) {
+    generatePlanButton.textContent = text;
+  }
+}
 
 function setOptimizeButtonText(text) {
   const liveLabel = document.querySelector("#optimize-label");
@@ -3488,26 +3502,93 @@ function normalizeAngle(angle) {
 
 function renderAll() {
   state.spacing = normalizeSpacing(state.spacing);
-  maxPlan = buildMaxPlan();
   serverNumber.value = state.server;
-  assignments = allocatePlan({ allowTrimming: true });
-  assignments = sealAssignmentOpenings(assignments);
-  assignments = reduceCleanSealedAssignments(assignments);
-  assignments = rebalanceAllianceOwnership(assignments);
-  enemyOpenCount = countEnemyOpenings(assignments);
-  if (enemyOpenCount && assignments.some((assignment) => assignment.flexTrim)) {
-    assignments = allocatePlan({ allowTrimming: false });
-    assignments = sealAssignmentOpenings(assignments);
-    assignments = reduceCleanSealedAssignments(assignments);
-    assignments = rebalanceAllianceOwnership(assignments);
-    enemyOpenCount = countEnemyOpenings(assignments);
+  applyGeneratedFillResult(buildGeneratedFillResult(generationSeed), { renderInputs: true });
+}
+
+function buildGeneratedFillResult(seed = makeGenerationSeed()) {
+  generationSeed = seed;
+  maxPlan = buildMaxPlan();
+  let candidateAssignments = allocatePlan({ allowTrimming: true });
+  candidateAssignments = sealAssignmentOpenings(candidateAssignments);
+  candidateAssignments = reduceCleanSealedAssignments(candidateAssignments);
+  candidateAssignments = rebalanceAllianceOwnership(candidateAssignments);
+  let candidateEnemyOpenCount = countEnemyOpenings(candidateAssignments);
+
+  if (candidateEnemyOpenCount && candidateAssignments.some((assignment) => assignment.flexTrim)) {
+    candidateAssignments = allocatePlan({ allowTrimming: false });
+    candidateAssignments = sealAssignmentOpenings(candidateAssignments);
+    candidateAssignments = reduceCleanSealedAssignments(candidateAssignments);
+    candidateAssignments = rebalanceAllianceOwnership(candidateAssignments);
+    candidateEnemyOpenCount = countEnemyOpenings(candidateAssignments);
   }
-  renderAllianceInputs();
+
+  return {
+    seed,
+    maxPlan: maxPlan.map((placement) => ({ ...placement })),
+    assignments: candidateAssignments.map((assignment) => ({ ...assignment })),
+    enemyOpenCount: candidateEnemyOpenCount,
+    enemyCandidateCount,
+    outerSupportPlan: outerSupportPlan.map((placement) => ({ ...placement })),
+  };
+}
+
+function applyGeneratedFillResult(result, { renderInputs = false } = {}) {
+  generationSeed = result.seed;
+  maxPlan = result.maxPlan.map((placement) => ({ ...placement }));
+  assignments = result.assignments.map((assignment) => ({ ...assignment }));
+  enemyOpenCount = result.enemyOpenCount;
+  enemyCandidateCount = result.enemyCandidateCount;
+  outerSupportPlan = result.outerSupportPlan.map((placement) => ({ ...placement }));
+
+  if (renderInputs) renderAllianceInputs();
   renderStats();
   renderMap();
   renderLegend();
   renderAssignmentTable();
   saveState();
+}
+
+async function generateBestFill({ attempts = 5, onProgress = () => {} } = {}) {
+  state.hqNames = {};
+  let best = null;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    onProgress(attempt, attempts);
+    await sleep(0);
+    const result = buildGeneratedFillResult(makeGenerationSeed());
+    if (!best || compareGeneratedFillResults(result, best) < 0) best = result;
+    await sleep(0);
+  }
+
+  return best;
+}
+
+function compareGeneratedFillResults(a, b) {
+  return lexicographicCompare(generatedFillScore(a), generatedFillScore(b));
+}
+
+function generatedFillScore(result) {
+  const activePlacements = result.assignments.filter((assignment) => !assignment.shortfall);
+  const contact = contactClusterStats(activePlacements, 4);
+
+  return [
+    result.enemyOpenCount,
+    activePlacements.length,
+    contact.excess,
+    contact.largest,
+    contactEdgeCount(activePlacements),
+    planLayoutPenalty(activePlacements),
+  ];
+}
+
+function lexicographicCompare(left, right) {
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] < right[index]) return -1;
+    if (left[index] > right[index]) return 1;
+  }
+
+  return 0;
 }
 
 function clearGeneratedFill() {
@@ -4503,7 +4584,9 @@ document.querySelector("#add-alliance").addEventListener("click", () => {
   allianceList.querySelector(".alliance-row:last-child input")?.focus();
 });
 
-document.querySelector("#generate-plan").addEventListener("click", () => {
+generatePlanButton.addEventListener("click", async () => {
+  if (generatePlanButton.disabled) return;
+
   if (!serverNumber.value.trim()) {
     serverNumber.classList.add("input-error");
     serverNumber.focus();
@@ -4513,9 +4596,25 @@ document.querySelector("#generate-plan").addEventListener("click", () => {
 
   serverNumber.classList.remove("input-error");
   syncStateFromForm();
-  startFreshGeneration();
-  renderAll();
-  showToast("Fill map generated");
+  state.spacing = normalizeSpacing(state.spacing);
+  serverNumber.value = state.server;
+  generatePlanButton.disabled = true;
+  if (optimizeFurtherButton) optimizeFurtherButton.disabled = true;
+  if (fillGapsButton) fillGapsButton.disabled = true;
+
+  try {
+    const best = await generateBestFill({
+      attempts: 5,
+      onProgress: (attempt, attempts) => setGenerateButtonText(`Generating ${attempt}/${attempts}`),
+    });
+    applyGeneratedFillResult(best, { renderInputs: true });
+    showToast(`Fill map generated: ${best.enemyOpenCount} enemy ${best.enemyOpenCount === 1 ? "HQ fits" : "HQs fit"}`);
+  } finally {
+    generatePlanButton.disabled = false;
+    if (optimizeFurtherButton) optimizeFurtherButton.disabled = false;
+    if (fillGapsButton) fillGapsButton.disabled = false;
+    setGenerateButtonText("Generate Fill");
+  }
 });
 
 if (optimizeFurtherButton) optimizeFurtherButton.addEventListener("click", async () => {
