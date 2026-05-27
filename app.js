@@ -3202,7 +3202,7 @@ function formatEnemyWarning(openDefenseSlots) {
     return `${enemyOpenCount.toLocaleString()} zero-spacing ${enemyOpeningLabel()} can still fit between defenders, and ${openDefenseSlots.toLocaleString()} ${defenseSlotLabel(openDefenseSlots)} remain unassigned.`;
   }
 
-  return `${enemyOpenCount.toLocaleString()} zero-spacing ${enemyOpeningLabel()} can still fit between defenders even with every defender slot placed. Review the blocked cells or fill rules.`;
+  return `${enemyOpenCount.toLocaleString()} ${enemyOpeningLabel()} can still fit between defenders. You can try "Generate Fill" again for a lower number, or move on to "Optimize" and then "Fill Gaps".`;
 }
 
 function cleanAllianceRows() {
@@ -4107,9 +4107,10 @@ function assignmentCopyName(assignment) {
   return getAssignmentName(assignment).trim();
 }
 
-function formatAssignmentCopyLine(assignment, index = null) {
+function formatAssignmentCopyLine(assignment, index = null, nameOverride = null) {
   const prefix = index === null ? "" : `${index + 1}, `;
-  return `${prefix}${formattedAssignmentLabel(assignment)}, ${assignmentCopyName(assignment)}, ${formatEmptyLand(assignment.anchor)}`;
+  const copyName = nameOverride === null ? assignmentCopyName(assignment) : String(nameOverride).trim();
+  return `${prefix}${formattedAssignmentLabel(assignment)}, ${copyName}, ${formatEmptyLand(assignment.anchor)}`;
 }
 
 function buildCoordinateText(compact = false) {
@@ -4719,7 +4720,12 @@ assignmentTable.addEventListener("input", (event) => {
 assignmentTable.addEventListener("click", (event) => {
   const copyButton = event.target.closest(".row-copy");
   if (!copyButton) return;
-  copyText(copyButton.dataset.copyText, "Coordinate copied");
+  const row = copyButton.closest(".table-row");
+  const nameInput = row?.querySelector(".assignment-name-input");
+  const nameKey = nameInput?.dataset.nameKey;
+  const assignment = assignments.find((item) => !item.shortfall && assignmentNameKey(item) === nameKey);
+  const copyLine = assignment ? formatAssignmentCopyLine(assignment, null, nameInput.value) : copyButton.dataset.copyText;
+  copyText(copyLine, "Coordinate copied");
 });
 
 legend.addEventListener("click", (event) => {
