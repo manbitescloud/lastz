@@ -154,6 +154,8 @@ const configFileInput = document.querySelector("#config-file");
 const downloadFallback = document.querySelector("#download-fallback");
 const optimizeFurtherButton = document.querySelector("#optimize-further");
 const optimizeLabel = document.querySelector("#optimize-label");
+const fillGapsButton = document.querySelector("#fill-gaps");
+const fillGapsLabel = document.querySelector("#fill-gaps-label");
 let downloadFallbackUrl = "";
 
 function setOptimizeButtonText(text) {
@@ -165,6 +167,18 @@ function setOptimizeButtonText(text) {
 
   if (optimizeFurtherButton) {
     optimizeFurtherButton.textContent = text;
+  }
+}
+
+function setFillGapsButtonText(text) {
+  const liveLabel = document.querySelector("#fill-gaps-label");
+  if (liveLabel) {
+    liveLabel.textContent = text;
+    return;
+  }
+
+  if (fillGapsButton) {
+    fillGapsButton.textContent = text;
   }
 }
 
@@ -311,6 +325,18 @@ function isValidDefensePlacement(candidate) {
   return (
     candidate.cells.every(isValidMudCell) &&
     candidate.buffer.every((cell) => isOuterMudCell(cell) || isBlockedCell(cell))
+  );
+}
+
+function isValidOuterOverlapDefensePlacement(candidate) {
+  const supportCells = outerSupportCellKeys();
+  const hasMudCell = candidate.cells.some(isValidMudCell);
+  const hasSupportCell = candidate.cells.some((cell) => supportCells.has(pointKey(cell)));
+
+  return (
+    hasMudCell &&
+    hasSupportCell &&
+    candidate.cells.every((cell) => isValidMudCell(cell) || supportCells.has(pointKey(cell)))
   );
 }
 
@@ -646,30 +672,40 @@ function buildMaxPlan() {
   )[0].plan;
 
   const repairCandidates = buildPlacementCandidates(FIXED_SPACING, "defense");
+  const outerOverlapCandidates = buildPlacementCandidates(FIXED_SPACING, "outer-defense");
+  const extendedRepairCandidates = uniqueCandidates(repairCandidates, outerOverlapCandidates);
   const slidPlan = repairEnemyOpeningsBySliding(bestPlan, enemyCandidates, repairCandidates, {
       passes: 7,
       maxMoveDistance: 4,
     });
   const reinforcedPlan = addEnemyBlockingPlacements(slidPlan, enemyCandidates, repairCandidates, { maxAdds: 28 });
+  const outerReinforcedPlan = addEnemyBlockingPlacements(reinforcedPlan, enemyCandidates, extendedRepairCandidates, {
+    maxAdds: 18,
+    preferOuterOverlap: true,
+  });
 
   return sortFillOrder(
-    repairEnemyOpeningsBySliding(reinforcedPlan, enemyCandidates, repairCandidates, {
+    repairEnemyOpeningsBySliding(outerReinforcedPlan, enemyCandidates, extendedRepairCandidates, {
       passes: 4,
-      maxMoveDistance: 4,
+      maxMoveDistance: 5,
     }),
   );
 }
 
 function buildPlacementCandidates(spacing, placementType = "defense") {
   const candidates = [];
-  const bounds = coordinateBounds(OUTER_MUD, CANDIDATE_PADDING);
+  const bounds = coordinateBounds(OUTER_MUD, placementType === "outer-defense" ? CANDIDATE_PADDING + 5 : CANDIDATE_PADDING);
   const supportCells = placementType === "defense" ? outerSupportCellKeys() : new Set();
 
   for (let y = bounds.minY; y <= bounds.maxY; y += 1) {
     for (let x = bounds.minX; x <= bounds.maxX; x += 1) {
       const candidate = buildCandidate({ x, y }, spacing);
       const isValid =
-        placementType === "enemy" ? isValidEnemyOpening(candidate) : isValidDefensePlacement(candidate);
+        placementType === "enemy"
+          ? isValidEnemyOpening(candidate)
+          : placementType === "outer-defense"
+            ? isValidOuterOverlapDefensePlacement(candidate)
+            : isValidDefensePlacement(candidate);
       if (isValid && !candidate.cellKeys.some((key) => supportCells.has(key))) {
         candidates.push(candidate);
       }
@@ -717,6 +753,14 @@ function buildCoveragePlan(defenderCandidates, enemyCandidates) {
   }
 
   return plan;
+}
+
+function uniqueCandidates(...candidateLists) {
+  const byId = new Map();
+  candidateLists.flat().forEach((candidate) => {
+    if (!byId.has(candidate.id)) byId.set(candidate.id, candidate);
+  });
+  return [...byId.values()];
 }
 
 function buildPlanVariants(defenderCandidates, enemyCandidates) {
@@ -859,7 +903,12 @@ function improveSealedPlanLayout(plan, enemyCandidates, defenderCandidates) {
   return improved;
 }
 
-function repairEnemyOpeningsBySliding(plan, enemyCandidates, defenderCandidates, { passes = 5, maxMoveDistance = 4 } = {}) {
+function repairEnemyOpeningsBySliding(
+  plan,
+  enemyCandidates,
+  defenderCandidates,
+  { passes = 5, maxMoveDistance = 4, maxClusterSize = MAX_CONTACT_CLUSTER_SIZE } = {},
+) {
   let repaired = [...plan];
   let baselineOpen = countEnemyOpeningsForPlacements(repaired, enemyCandidates);
   let baselineEdges = contactEdgeCount(repaired);
@@ -897,7 +946,7 @@ function repairEnemyOpeningsBySliding(plan, enemyCandidates, defenderCandidates,
         .filter((candidate) => hexDistance(candidate.anchor, target.anchor) <= maxMoveDistance)
         .filter((candidate) => !candidate.cellKeys.some((key) => occupied.has(key)))
         .filter((candidate) =>
-          !wouldExceedContactCluster(candidate, withoutTarget, MAX_CONTACT_CLUSTER_SIZE, contactCounts, cellIndex)
+          !wouldExceedContactCluster(candidate, withoutTarget, maxClusterSize, contactCounts, cellIndex)
         )
         .map((candidate) => ({
           candidate,
@@ -913,8 +962,8 @@ function repairEnemyOpeningsBySliding(plan, enemyCandidates, defenderCandidates,
         .slice(0, 28);
 
       for (const { candidate } of options) {
-        const proposal = [...withoutTarget, candidate];
-        const nextContact = contactClusterStats(proposal);
+        const proposal = [...withoutTarget, { ...target, ...candidate, flexAdjusted: true, slideRepair: true }];
+        const nextContact = contactClusterStats(proposal, maxClusterSize);
         if (nextContact.excess) continue;
 
         const nextOpen = countEnemyOpeningsForPlacements(proposal, enemyCandidates);
@@ -939,7 +988,242 @@ function repairEnemyOpeningsBySliding(plan, enemyCandidates, defenderCandidates,
   return repaired;
 }
 
-function addEnemyBlockingPlacements(plan, enemyCandidates, defenderCandidates, { maxAdds = 20 } = {}) {
+async function repairEnemyOpeningsByFocusedSlides(
+  plan,
+  enemyCandidates,
+  defenderCandidates,
+  {
+    passes = 4,
+    maxMoveDistance = 1,
+    maxClusterSize = MAX_CONTACT_CLUSTER_SIZE,
+    maxGroupSize = 2,
+    acceptTargetOnly = true,
+    requireOpenImprovement = false,
+    deadline = Number.POSITIVE_INFINITY,
+    yieldIfNeeded = async () => {},
+  } = {},
+) {
+  let repaired = [...plan];
+  let baselineOpen = countEnemyOpeningsForPlacements(repaired, enemyCandidates);
+  let baselineEdges = contactEdgeCount(repaired);
+
+  for (let pass = 0; pass < passes && baselineOpen > 0 && Date.now() < deadline; pass += 1) {
+    await yieldIfNeeded();
+    const visibleEnemyPack = enemyPlacementPackForPlacements(repaired, enemyCandidates);
+    if (!visibleEnemyPack.length) break;
+
+    let best = null;
+
+    for (const enemy of visibleEnemyPack) {
+      if (Date.now() >= deadline) break;
+      await yieldIfNeeded();
+
+      const enemyCellKeys = new Set(enemy.cellKeys);
+      const movers = repaired
+        .map((placement) => ({
+          placement,
+          distance: nearestDistanceToGroup(placement, [enemy]),
+          overlap: placement.cellKeys.filter((key) => enemyCellKeys.has(key)).length,
+        }))
+        .filter(({ distance }) => distance <= 9)
+        .sort(
+          (a, b) =>
+            a.distance - b.distance ||
+            b.overlap - a.overlap ||
+            innerCleanlinessWeight(b.placement) - innerCleanlinessWeight(a.placement),
+        )
+        .slice(0, 14);
+
+      const optionsByPlacement = new Map();
+      for (const { placement } of movers) {
+        const options = focusedSlideOptionsForPlacement(
+          placement,
+          repaired.filter((item) => item.id !== placement.id),
+          defenderCandidates,
+          enemyCellKeys,
+          { maxMoveDistance, maxClusterSize },
+        );
+        if (options.length) optionsByPlacement.set(placement.id, options);
+      }
+
+      for (const { placement } of movers) {
+        const options = optionsByPlacement.get(placement.id) || [];
+        for (const option of options) {
+          const proposal = buildFocusedSlideProposal(repaired, [{ target: placement, candidate: option.candidate }], maxClusterSize);
+          const scored = scoreFocusedSlideProposal(proposal, enemyCandidates, baselineOpen, baselineEdges, enemy, {
+            acceptTargetOnly,
+            requireOpenImprovement,
+          });
+          if (!scored) continue;
+          if (!best || scored.score < best.score) best = scored;
+        }
+      }
+
+      const pairMovers = movers.filter(({ placement }) => optionsByPlacement.has(placement.id)).slice(0, 10);
+      for (let groupSize = 2; groupSize <= maxGroupSize; groupSize += 1) {
+        for (const moverGroup of combinations(pairMovers, groupSize)) {
+          if (Date.now() >= deadline) break;
+          const targets = moverGroup.map(({ placement }) => placement);
+          const targetIds = new Set(targets.map((target) => target.id));
+          const fixedGroupPlacements = repaired.filter((placement) => !targetIds.has(placement.id));
+          const optionGroups = targets.map((target) =>
+            focusedSlideOptionsForPlacement(target, fixedGroupPlacements, defenderCandidates, enemyCellKeys, {
+              maxMoveDistance,
+              maxClusterSize,
+            }).slice(0, groupSize === 3 ? 5 : 7),
+          );
+          if (optionGroups.some((options) => !options.length)) continue;
+
+          for (const optionCombo of cartesianProduct(optionGroups)) {
+            const proposal = buildFocusedSlideProposal(
+              repaired,
+              targets.map((target, index) => ({ target, candidate: optionCombo[index].candidate })),
+              maxClusterSize,
+            );
+            const scored = scoreFocusedSlideProposal(proposal, enemyCandidates, baselineOpen, baselineEdges, enemy, {
+              acceptTargetOnly,
+              requireOpenImprovement,
+            });
+            if (!scored) continue;
+            if (!best || scored.score < best.score) best = scored;
+          }
+        }
+      }
+    }
+
+    if (!best) break;
+    repaired = best.plan;
+    baselineOpen = best.open;
+    baselineEdges = best.edges;
+  }
+
+  return repaired;
+}
+
+function focusedSlideOptionsForPlacement(
+  target,
+  fixedPlacements,
+  defenderCandidates,
+  enemyCellKeys,
+  { maxMoveDistance, maxClusterSize },
+) {
+  const occupied = new Set(fixedPlacements.flatMap((placement) => placement.cellKeys));
+  const contactCounts = contactCountsForPlacements(fixedPlacements);
+  const cellIndex = placementCellIndex(fixedPlacements);
+
+  return defenderCandidates
+    .filter((candidate) => candidate.id !== target.id)
+    .filter((candidate) => hexDistance(candidate.anchor, target.anchor) <= maxMoveDistance)
+    .filter((candidate) => candidate.cellKeys.some((key) => enemyCellKeys.has(key)))
+    .filter((candidate) => !candidate.cellKeys.some((key) => occupied.has(key)))
+    .filter((candidate) => !wouldExceedContactCluster(candidate, fixedPlacements, maxClusterSize, contactCounts, cellIndex))
+    .map((candidate) => ({
+      candidate,
+      blockedCells: candidate.cellKeys.filter((key) => enemyCellKeys.has(key)).length,
+      distance: hexDistance(candidate.anchor, target.anchor),
+    }))
+    .sort(
+      (a, b) =>
+        b.blockedCells - a.blockedCells ||
+        a.distance - b.distance ||
+        favorablePlacementScore(a.candidate) - favorablePlacementScore(b.candidate) ||
+        coverageCandidateScore(a.candidate, fixedPlacements) - coverageCandidateScore(b.candidate, fixedPlacements),
+    )
+    .slice(0, 10);
+}
+
+function buildFocusedSlideProposal(activePlacements, moves, maxClusterSize) {
+  const movedIds = new Set(moves.map((move) => move.target.id));
+  const fixedPlacements = activePlacements.filter((placement) => !movedIds.has(placement.id));
+  const proposal = [...fixedPlacements];
+  const occupied = new Set(fixedPlacements.flatMap((placement) => placement.cellKeys));
+
+  for (const move of moves) {
+    if (move.candidate.cellKeys.some((key) => occupied.has(key))) return null;
+    const moved = { ...move.target, ...move.candidate, flexAdjusted: true, focusedSlide: true };
+    proposal.push(moved);
+    moved.cellKeys.forEach((key) => occupied.add(key));
+  }
+
+  const contact = contactClusterStats(proposal, maxClusterSize);
+  if (contact.excess) return null;
+  return proposal;
+}
+
+function scoreFocusedSlideProposal(
+  proposal,
+  enemyCandidates,
+  baselineOpen,
+  baselineEdges,
+  targetEnemy = null,
+  { acceptTargetOnly = true, requireOpenImprovement = false } = {},
+) {
+  if (!proposal) return null;
+
+  const nextOpen = countEnemyOpeningsForPlacements(proposal, enemyCandidates);
+  const nextEdges = contactEdgeCount(proposal);
+  const targetBlocked = targetEnemy ? isEnemyCandidateBlocked(targetEnemy, proposal) : false;
+  const improvesOpen = nextOpen < baselineOpen;
+  const improvesEdges = nextOpen === baselineOpen && nextEdges < baselineEdges;
+  const removesVisibleEnemy = acceptTargetOnly && targetBlocked && nextOpen <= baselineOpen;
+  if (requireOpenImprovement && !improvesOpen) return null;
+  if (!improvesOpen && !improvesEdges && !removesVisibleEnemy) return null;
+
+  return {
+    plan: proposal,
+    open: nextOpen,
+    edges: nextEdges,
+    score: nextOpen * 10000000 + nextEdges * 80000 - Number(targetBlocked) * 650000 + planLayoutPenalty(proposal),
+  };
+}
+
+function combinations(items, size) {
+  const result = [];
+  const picked = [];
+
+  function visit(start) {
+    if (picked.length === size) {
+      result.push([...picked]);
+      return;
+    }
+
+    for (let index = start; index <= items.length - (size - picked.length); index += 1) {
+      picked.push(items[index]);
+      visit(index + 1);
+      picked.pop();
+    }
+  }
+
+  visit(0);
+  return result;
+}
+
+function cartesianProduct(groups) {
+  return groups.reduce(
+    (products, group) => products.flatMap((product) => group.map((item) => [...product, item])),
+    [[]],
+  );
+}
+
+function isEnemyCandidateBlocked(enemyCandidate, placements, supportPlacements = outerSupportPlan) {
+  const occupied = new Set();
+  [...placements, ...supportPlacements].forEach((placement) => placement.cellKeys.forEach((key) => occupied.add(key)));
+  return enemyCandidate.cellKeys.some((key) => occupied.has(key));
+}
+
+function placementAnchorSignature(placements) {
+  return placements
+    .map((placement) => `${placement.id}:${placement.anchor.x},${placement.anchor.y}`)
+    .sort()
+    .join("|");
+}
+
+function isOuterOverlapPlacement(placement) {
+  const supportCells = outerSupportCellKeys();
+  return placement.cells.some((cell) => supportCells.has(pointKey(cell)));
+}
+
+function addEnemyBlockingPlacements(plan, enemyCandidates, defenderCandidates, { maxAdds = 20, preferOuterOverlap = false } = {}) {
   let reinforced = [...plan];
   let baselineOpen = countEnemyOpeningsForPlacements(reinforced, enemyCandidates);
 
@@ -958,11 +1242,13 @@ function addEnemyBlockingPlacements(plan, enemyCandidates, defenderCandidates, {
         candidate,
         blocksVisible: candidate.cellKeys.filter((key) => enemyCells.has(key)).length,
         touchCount: touchedPlacements(candidate, reinforced, cellIndex).length,
+        outerOverlap: isOuterOverlapPlacement(candidate),
       }))
       .filter((option) => option.blocksVisible)
       .sort(
         (a, b) =>
           b.blocksVisible - a.blocksVisible ||
+          (preferOuterOverlap ? Number(b.outerOverlap) - Number(a.outerOverlap) : 0) ||
           a.touchCount - b.touchCount ||
           coverageCandidateScore(a.candidate, reinforced) - coverageCandidateScore(b.candidate, reinforced),
       )
@@ -1472,14 +1758,33 @@ async function optimizeActivePlacementsFurther(currentAssignments, { durationMs 
 
   const enemyCandidates = buildPlacementCandidates(0, "enemy");
   await yieldIfNeeded();
-  const defenseCandidates = buildPlacementCandidates(FIXED_SPACING, "defense");
+  const defenseCandidates = uniqueCandidates(
+    buildPlacementCandidates(FIXED_SPACING, "defense"),
+    buildPlacementCandidates(FIXED_SPACING, "outer-defense"),
+  );
   await yieldIfNeeded();
   let activePlacements = currentAssignments.filter((assignment) => !assignment.shortfall).map((assignment) => ({ ...assignment }));
   let baselineOpen = countEnemyOpeningsForPlacements(activePlacements, enemyCandidates);
   let baselineEdges = contactEdgeCount(activePlacements);
 
-  for (let pass = 0; pass < 20 && baselineEdges > 0 && Date.now() < deadline; pass += 1) {
+  for (let pass = 0; pass < 20 && (baselineEdges > 0 || baselineOpen > 0) && Date.now() < deadline; pass += 1) {
     await yieldIfNeeded();
+    const focusedSlides = await repairEnemyOpeningsByFocusedSlides(activePlacements, enemyCandidates, defenseCandidates, {
+      passes: 3,
+      maxMoveDistance: 2,
+      deadline,
+      yieldIfNeeded,
+    });
+    const focusedChanged = placementAnchorSignature(focusedSlides) !== placementAnchorSignature(activePlacements);
+    const focusedOpen = countEnemyOpeningsForPlacements(focusedSlides, enemyCandidates);
+    const focusedEdges = contactEdgeCount(focusedSlides);
+    if (focusedOpen < baselineOpen || (focusedOpen === baselineOpen && focusedEdges < baselineEdges) || (focusedChanged && focusedOpen <= baselineOpen)) {
+      activePlacements = focusedSlides;
+      baselineOpen = focusedOpen;
+      baselineEdges = focusedEdges;
+      continue;
+    }
+
     const rebuilt = await optimizeByRebuildingContactClusters(
       activePlacements,
       enemyCandidates,
@@ -1506,16 +1811,6 @@ async function optimizeActivePlacementsFurther(currentAssignments, { durationMs 
       activePlacements = slidForSeal;
       baselineOpen = slidOpen;
       baselineEdges = slidEdges;
-      continue;
-    }
-
-    const reinforcedForSeal = addEnemyBlockingPlacements(activePlacements, enemyCandidates, defenseCandidates, { maxAdds: 8 });
-    const reinforcedOpen = countEnemyOpeningsForPlacements(reinforcedForSeal, enemyCandidates);
-    const reinforcedEdges = contactEdgeCount(reinforcedForSeal);
-    if (reinforcedOpen < baselineOpen || (reinforcedOpen === baselineOpen && reinforcedEdges < baselineEdges)) {
-      activePlacements = reinforcedForSeal;
-      baselineOpen = reinforcedOpen;
-      baselineEdges = reinforcedEdges;
       continue;
     }
 
@@ -1596,10 +1891,306 @@ async function optimizeActivePlacementsFurther(currentAssignments, { durationMs 
       if (Date.now() >= deadline) break;
     }
 
+    if (!changed) {
+      const lastGaspSlide = repairEnemyOpeningsBySliding(activePlacements, enemyCandidates, defenseCandidates, {
+        passes: 2,
+        maxMoveDistance: 6,
+        maxClusterSize: 3,
+      });
+      const lastGaspOpen = countEnemyOpeningsForPlacements(lastGaspSlide, enemyCandidates);
+      const lastGaspEdges = contactEdgeCount(lastGaspSlide);
+      const lastGaspContact = contactClusterStats(lastGaspSlide, 3);
+      const normalContact = contactClusterStats(lastGaspSlide, MAX_CONTACT_CLUSTER_SIZE);
+      const onlyRareCluster = normalContact.excess <= 1 && lastGaspContact.excess === 0;
+      if (onlyRareCluster && (lastGaspOpen < baselineOpen || (lastGaspOpen === baselineOpen && lastGaspEdges < baselineEdges))) {
+        activePlacements = lastGaspSlide;
+        baselineOpen = lastGaspOpen;
+        baselineEdges = lastGaspEdges;
+        continue;
+      }
+
+      break;
+    }
+  }
+
+  return activePlacements;
+}
+
+async function fillActiveGaps(currentAssignments, { durationMs = 30000, onProgress = () => {} } = {}) {
+  const deadline = Date.now() + durationMs;
+  let lastYield = 0;
+  const yieldIfNeeded = async () => {
+    const now = Date.now();
+    if (now - lastYield < 140) return;
+    lastYield = now;
+    onProgress(Math.max(0, Math.ceil((deadline - now) / 1000)));
+    await sleep(0);
+  };
+
+  const enemyCandidates = buildPlacementCandidates(0, "enemy");
+  const slideCandidates = uniqueCandidates(
+    buildPlacementCandidates(FIXED_SPACING, "defense"),
+    buildPlacementCandidates(FIXED_SPACING, "outer-defense"),
+  );
+  const gapFillCandidates = uniqueCandidates(slideCandidates, buildPlacementCandidates(0, "enemy"));
+  let activePlacements = currentAssignments.filter((assignment) => !assignment.shortfall).map((assignment) => ({ ...assignment }));
+  let baselineOpen = countEnemyOpeningsForPlacements(activePlacements, enemyCandidates);
+
+  onProgress(Math.max(0, Math.ceil((deadline - Date.now()) / 1000)));
+  await sleep(0);
+
+  for (let pass = 0; pass < 10 && baselineOpen > 0 && Date.now() < deadline; pass += 1) {
+    await yieldIfNeeded();
+    let changed = false;
+    const strictSlides = await repairEnemyOpeningsByFocusedSlides(activePlacements, enemyCandidates, slideCandidates, {
+      passes: 2,
+      maxMoveDistance: 2,
+      maxGroupSize: 3,
+      maxClusterSize: MAX_CONTACT_CLUSTER_SIZE,
+      acceptTargetOnly: false,
+      requireOpenImprovement: true,
+      deadline,
+      yieldIfNeeded,
+    });
+    const strictOpen = countEnemyOpeningsForPlacements(strictSlides, enemyCandidates);
+    if (strictOpen < baselineOpen) {
+      activePlacements = strictSlides;
+      baselineOpen = strictOpen;
+      changed = true;
+    }
+
+    const looseSlides = await repairEnemyOpeningsByFocusedSlides(activePlacements, enemyCandidates, gapFillCandidates, {
+      passes: 2,
+      maxMoveDistance: 3,
+      maxGroupSize: 3,
+      maxClusterSize: 3,
+      acceptTargetOnly: true,
+      requireOpenImprovement: false,
+      deadline,
+      yieldIfNeeded,
+    });
+    const looseChanged = placementAnchorSignature(looseSlides) !== placementAnchorSignature(activePlacements);
+    const looseOpen = countEnemyOpeningsForPlacements(looseSlides, enemyCandidates);
+    if (looseOpen < baselineOpen || (looseChanged && looseOpen <= baselineOpen)) {
+      activePlacements = looseSlides;
+      baselineOpen = looseOpen;
+      changed = true;
+    }
+
+    const gapFilled = await addGapFillPlacements(activePlacements, enemyCandidates, gapFillCandidates, {
+      maxAdds: 40,
+      maxClusterSize: 3,
+      deadline,
+      yieldIfNeeded,
+    });
+    const filledOpen = countEnemyOpeningsForPlacements(gapFilled, enemyCandidates);
+    if (filledOpen < baselineOpen || placementAnchorSignature(gapFilled) !== placementAnchorSignature(activePlacements)) {
+      activePlacements = gapFilled;
+      baselineOpen = filledOpen;
+      changed = true;
+    }
+
     if (!changed) break;
   }
 
   return activePlacements;
+}
+
+async function addGapFillPlacements(
+  plan,
+  enemyCandidates,
+  defenseCandidates,
+  { maxAdds = 40, maxClusterSize = 3, deadline = Number.POSITIVE_INFINITY, yieldIfNeeded = async () => {} } = {},
+) {
+  let filled = [...plan];
+  let baselineOpen = countEnemyOpeningsForPlacements(filled, enemyCandidates);
+  const enemyByCell = enemyCellIndex(enemyCandidates);
+
+  for (let added = 0; added < maxAdds && baselineOpen > 0 && Date.now() < deadline; added += 1) {
+    await yieldIfNeeded();
+    const visibleEnemyPack = enemyPlacementPackForPlacements(filled, enemyCandidates);
+    const visibleEnemyIds = new Set(visibleEnemyPack.map((enemy) => enemy.id));
+    const visibleEnemyCells = new Set(visibleEnemyPack.flatMap((enemy) => enemy.cellKeys));
+    const occupied = new Set(filled.flatMap((placement) => placement.cellKeys));
+    const contactCounts = contactCountsForPlacements(filled);
+    const cellIndex = placementCellIndex(filled);
+    const directBlocker = await findDirectEnemyBlockerPlacement(filled, visibleEnemyPack, enemyCandidates, defenseCandidates, {
+      maxClusterSize,
+      deadline,
+      yieldIfNeeded,
+    });
+    if (directBlocker) {
+      filled = directBlocker;
+      baselineOpen = countEnemyOpeningsForPlacements(filled, enemyCandidates);
+      continue;
+    }
+
+    const options = defenseCandidates
+      .filter((candidate) => !candidate.cellKeys.some((key) => occupied.has(key)))
+      .map((candidate) => ({
+        candidate,
+        visibleCells: candidate.cellKeys.filter((key) => visibleEnemyCells.has(key)).length,
+        blockedVisible: blockedEnemyIdsFor(candidate, enemyByCell, visibleEnemyIds).size,
+        touchCount: touchedPlacements(candidate, filled, cellIndex).length,
+      }))
+      .filter((option) => option.visibleCells || option.blockedVisible)
+      .sort(
+        (a, b) =>
+          b.blockedVisible - a.blockedVisible ||
+          b.visibleCells - a.visibleCells ||
+          a.touchCount - b.touchCount ||
+          coverageCandidateScore(a.candidate, filled) - coverageCandidateScore(b.candidate, filled),
+      )
+      .slice(0, 80);
+
+    let best = null;
+
+    for (const { candidate, blockedVisible, visibleCells, touchCount } of options) {
+      if (Date.now() >= deadline) break;
+      let proposal = [...filled, { ...candidate, flexAdjusted: true, gapFill: true }];
+      let contact = contactClusterStats(proposal, maxClusterSize);
+      if (contact.excess) {
+        proposal = await reduceContactClustersBySliding(proposal, enemyCandidates, defenseCandidates, {
+          maxClusterSize,
+          maxMoveDistance: 4,
+          deadline,
+          yieldIfNeeded,
+        });
+        contact = contactClusterStats(proposal, maxClusterSize);
+        if (contact.excess) continue;
+      }
+
+      const nextOpen = countEnemyOpeningsForPlacements(proposal, enemyCandidates);
+      const blocksVisibleGap = blockedVisible > 0 && nextOpen <= baselineOpen;
+      if (nextOpen >= baselineOpen && !blocksVisibleGap) continue;
+
+      const score =
+        nextOpen * 10000000 +
+        contactEdgeCount(proposal) * 100000 -
+        blockedVisible * 900000 -
+        visibleCells * 25000 +
+        touchCount * 15000 +
+        planLayoutPenalty(proposal);
+      if (!best || score < best.score) best = { proposal, nextOpen, score };
+    }
+
+    if (!best) break;
+    filled = best.proposal;
+    baselineOpen = Math.min(baselineOpen, best.nextOpen);
+
+    filled = await repairEnemyOpeningsByFocusedSlides(filled, enemyCandidates, defenseCandidates, {
+      passes: 2,
+      maxMoveDistance: 3,
+      maxGroupSize: 3,
+      maxClusterSize,
+      acceptTargetOnly: true,
+      deadline,
+      yieldIfNeeded,
+    });
+    baselineOpen = countEnemyOpeningsForPlacements(filled, enemyCandidates);
+  }
+
+  return filled;
+}
+
+async function findDirectEnemyBlockerPlacement(
+  filled,
+  visibleEnemyPack,
+  enemyCandidates,
+  defenseCandidates,
+  { maxClusterSize, deadline, yieldIfNeeded },
+) {
+  const occupied = new Set(filled.flatMap((placement) => placement.cellKeys));
+
+  for (const enemy of visibleEnemyPack) {
+    if (Date.now() >= deadline) break;
+    if (enemy.cellKeys.some((key) => occupied.has(key))) continue;
+
+    let proposal = [...filled, { ...enemy, flexAdjusted: true, gapFill: true, directEnemyBlocker: true }];
+    let contact = contactClusterStats(proposal, maxClusterSize);
+    if (contact.excess) {
+      proposal = await reduceContactClustersBySliding(proposal, enemyCandidates, defenseCandidates, {
+        maxClusterSize,
+        maxMoveDistance: 4,
+        deadline,
+        yieldIfNeeded,
+      });
+      contact = contactClusterStats(proposal, maxClusterSize);
+      if (contact.excess) continue;
+    }
+
+    return proposal;
+  }
+
+  return null;
+}
+
+async function reduceContactClustersBySliding(
+  plan,
+  enemyCandidates,
+  defenseCandidates,
+  { maxClusterSize = 3, maxMoveDistance = 4, deadline = Number.POSITIVE_INFINITY, yieldIfNeeded = async () => {} } = {},
+) {
+  let repaired = [...plan];
+  let baselineOpen = countEnemyOpeningsForPlacements(repaired, enemyCandidates);
+
+  for (let pass = 0; pass < 4 && Date.now() < deadline; pass += 1) {
+    const oversized = contactClusters(repaired).filter((cluster) => cluster.members.length > maxClusterSize);
+    if (!oversized.length) break;
+
+    let changed = false;
+    for (const cluster of oversized) {
+      if (Date.now() >= deadline) break;
+      await yieldIfNeeded();
+
+      const movers = [...cluster.members].sort(
+        (a, b) =>
+          Number(Boolean(b.gapFill || b.directEnemyBlocker)) - Number(Boolean(a.gapFill || a.directEnemyBlocker)) ||
+          (contactCountsForPlacements(repaired).get(b.id) || 0) - (contactCountsForPlacements(repaired).get(a.id) || 0),
+      );
+
+      for (const target of movers) {
+        const withoutTarget = repaired.filter((placement) => placement.id !== target.id);
+        const occupied = new Set(withoutTarget.flatMap((placement) => placement.cellKeys));
+        const contactCounts = contactCountsForPlacements(withoutTarget);
+        const cellIndex = placementCellIndex(withoutTarget);
+        const options = defenseCandidates
+          .filter((candidate) => candidate.id !== target.id)
+          .filter((candidate) => hexDistance(candidate.anchor, target.anchor) <= maxMoveDistance)
+          .filter((candidate) => !candidate.cellKeys.some((key) => occupied.has(key)))
+          .filter((candidate) => !wouldExceedContactCluster(candidate, withoutTarget, maxClusterSize, contactCounts, cellIndex))
+          .sort(
+            (a, b) =>
+              countEnemyOpeningsForPlacements([...withoutTarget, { ...target, ...a }], enemyCandidates) -
+                countEnemyOpeningsForPlacements([...withoutTarget, { ...target, ...b }], enemyCandidates) ||
+              hexDistance(a.anchor, target.anchor) - hexDistance(b.anchor, target.anchor) ||
+              coverageCandidateScore(a, withoutTarget) - coverageCandidateScore(b, withoutTarget),
+          )
+          .slice(0, 24);
+
+        for (const candidate of options) {
+          const proposal = [...withoutTarget, { ...target, ...candidate, flexAdjusted: true, clusterRelief: true }];
+          const contact = contactClusterStats(proposal, maxClusterSize);
+          if (contact.excess) continue;
+          const nextOpen = countEnemyOpeningsForPlacements(proposal, enemyCandidates);
+          if (nextOpen > baselineOpen) continue;
+
+          repaired = proposal;
+          baselineOpen = nextOpen;
+          changed = true;
+          break;
+        }
+
+        if (changed) break;
+      }
+
+      if (changed) break;
+    }
+
+    if (!changed) break;
+  }
+
+  return repaired;
 }
 
 function nearestContactedDistance(placement, contactedPlacements) {
@@ -1868,7 +2459,7 @@ function rebalanceAllianceOwnership(currentAssignments) {
       });
     });
 
-    for (let index = filledTarget; index < alliance.count; index += 1) {
+    for (let index = placements.length; index < alliance.count; index += 1) {
       balanced.push({
         alliance,
         allianceIndex,
@@ -1904,7 +2495,68 @@ function assignStrategicAllianceGroups(activeAlliances, activePlacements, target
     placementsByAlliance.set(alliance.id, picked);
   });
 
-  return mergeDetachedAllianceComponents(placementsByAlliance, activeAlliances);
+  const mergedGroups = mergeDetachedAllianceComponents(placementsByAlliance, activeAlliances);
+  return rebalancePriorityPlacementCounts(mergedGroups, activeAlliances, targets);
+}
+
+function rebalancePriorityPlacementCounts(placementsByAlliance, activeAlliances, targets) {
+  const groups = activeAlliances.map((alliance, index) => ({
+    originalIndex: index,
+    placements: placementsByAlliance.get(alliance.id) || [],
+  }));
+  if (groups.length < 2 || groups.length > 8) return placementsByAlliance;
+
+  let best = null;
+  for (const order of permutations(groups)) {
+    const score = groupOwnershipScore(order, activeAlliances, targets);
+    if (!best || score < best.score) best = { order, score };
+  }
+
+  if (!best) return placementsByAlliance;
+
+  const reassigned = new Map();
+  activeAlliances.forEach((alliance, index) => {
+    reassigned.set(alliance.id, best.order[index].placements);
+  });
+  return reassigned;
+}
+
+function groupOwnershipScore(groupOrder, activeAlliances, targets) {
+  let score = 0;
+
+  groupOrder.forEach((group, index) => {
+    const alliance = activeAlliances[index];
+    const count = group.placements.length;
+    const target = targets.get(alliance.id) || 0;
+    const request = alliance.count;
+    score += Math.abs(count - target) * 25000;
+    score += Math.max(0, request - count) * Math.max(1, request) * 1200;
+    score += Math.max(0, count - request) * 1800;
+    score += Math.abs(group.originalIndex - index) * 75;
+  });
+
+  for (let left = 0; left < activeAlliances.length; left += 1) {
+    for (let right = 0; right < activeAlliances.length; right += 1) {
+      if (left === right || activeAlliances[left].count <= activeAlliances[right].count) continue;
+      const leftCount = groupOrder[left].placements.length;
+      const rightCount = groupOrder[right].placements.length;
+      if (leftCount < rightCount) score += (rightCount - leftCount) * 10000000;
+    }
+  }
+
+  return score;
+}
+
+function permutations(items) {
+  if (items.length <= 1) return [items];
+  const result = [];
+
+  items.forEach((item, index) => {
+    const rest = [...items.slice(0, index), ...items.slice(index + 1)];
+    permutations(rest).forEach((permutation) => result.push([item, ...permutation]));
+  });
+
+  return result;
 }
 
 function mergeDetachedAllianceComponents(placementsByAlliance, activeAlliances) {
@@ -2111,7 +2763,34 @@ function flexibleAllianceTargets(activeAlliances, filledCount) {
     }
   }
 
+  enforceAlliancePriorityTargets(activeAlliances, targets);
   return targets;
+}
+
+function enforceAlliancePriorityTargets(activeAlliances, targets) {
+  let changed = true;
+
+  while (changed) {
+    changed = false;
+
+    for (const higher of activeAlliances) {
+      for (const lower of activeAlliances) {
+        if (higher.id === lower.id || higher.count <= lower.count) continue;
+
+        const higherTarget = targets.get(higher.id) || 0;
+        const lowerTarget = targets.get(lower.id) || 0;
+        const lowerHasExcess = lowerTarget > lower.count;
+        const higherIsShort = higherTarget < higher.count;
+        const inverted = higherTarget < lowerTarget;
+
+        if (lowerTarget <= 0 || !inverted || (!lowerHasExcess && !higherIsShort)) continue;
+
+        targets.set(higher.id, higherTarget + 1);
+        targets.set(lower.id, lowerTarget - 1);
+        changed = true;
+      }
+    }
+  }
 }
 
 function countOpenDefenseSlots(currentAssignments) {
@@ -2520,12 +3199,10 @@ function renderStats() {
   const activeAssignments = assignments.filter((assignment) => !assignment.shortfall);
   const assigned = activeAssignments.length;
   const requested = requestedTotal();
-  const edgePairs = contactEdgeCount(activeAssignments);
   const stats = [
     ["defender-slots", "Defender Slots", maxPlan.length.toLocaleString()],
     ["requested", "Requested", requested.toLocaleString()],
     ["placed", "Placed", assigned.toLocaleString()],
-    ["edge-pairs", "HQ Edge Pairs", edgePairs.toLocaleString()],
     ["enemy-hqs-fit", "Enemy HQs Fit", enemyOpenCount.toLocaleString()],
     ["seal-status", "Seal Status", enemyOpenCount ? "Open" : "Sealed"],
     [
@@ -3482,6 +4159,7 @@ if (optimizeFurtherButton) optimizeFurtherButton.addEventListener("click", async
     setCountdown(Math.max(0, Math.ceil((deadline - Date.now()) / 1000)));
   };
   optimizeFurtherButton.disabled = true;
+  if (fillGapsButton) fillGapsButton.disabled = true;
   refreshCountdown();
   const countdownTimer = setInterval(refreshCountdown, 250);
   showToast("Deeper optimization started");
@@ -3505,7 +4183,54 @@ if (optimizeFurtherButton) optimizeFurtherButton.addEventListener("click", async
   } finally {
     clearInterval(countdownTimer);
     optimizeFurtherButton.disabled = false;
+    if (fillGapsButton) fillGapsButton.disabled = false;
     setOptimizeButtonText("Optimize Further");
+  }
+});
+
+if (fillGapsButton) fillGapsButton.addEventListener("click", async () => {
+  if (fillGapsButton.disabled) return;
+
+  const durationMs = 30000;
+  const deadline = Date.now() + durationMs;
+  const beforeOpen = countEnemyOpenings(assignments);
+  const setCountdown = (seconds) => {
+    setFillGapsButtonText(`Filling ${seconds}s`);
+  };
+  const refreshCountdown = () => {
+    setCountdown(Math.max(0, Math.ceil((deadline - Date.now()) / 1000)));
+  };
+  fillGapsButton.disabled = true;
+  if (optimizeFurtherButton) optimizeFurtherButton.disabled = true;
+  refreshCountdown();
+  const countdownTimer = setInterval(refreshCountdown, 250);
+  showToast("Gap fill started");
+
+  try {
+    await sleep(60);
+    const filledActive = await fillActiveGaps(assignments, {
+      durationMs,
+      onProgress: setCountdown,
+    });
+    assignments = rebalanceAllianceOwnership([...filledActive, ...assignments.filter((assignment) => assignment.shortfall)]);
+    enemyOpenCount = countEnemyOpenings(assignments);
+    renderStats();
+    renderMap();
+    renderLegend();
+    renderAssignmentTable();
+    saveState();
+
+    const removed = beforeOpen - enemyOpenCount;
+    if (!enemyOpenCount) {
+      showToast("Mud sealed");
+    } else {
+      showToast(removed > 0 ? `Filled ${removed} enemy ${removed === 1 ? "gap" : "gaps"}` : "No gap fill found");
+    }
+  } finally {
+    clearInterval(countdownTimer);
+    fillGapsButton.disabled = false;
+    if (optimizeFurtherButton) optimizeFurtherButton.disabled = false;
+    setFillGapsButtonText("Fill Gaps");
   }
 });
 
