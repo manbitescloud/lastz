@@ -1993,7 +1993,79 @@ async function fillActiveGaps(currentAssignments, { durationMs = 30000, onProgre
     if (!changed) break;
   }
 
+  if (baselineOpen > 0) {
+    const emergencyDeadline = Math.max(deadline, Date.now() + 6000);
+    const clusterSafeFill = await forceFillRemainingEnemyGaps(activePlacements, enemyCandidates, gapFillCandidates, {
+      maxClusterSize: 3,
+      allowOversizedClusters: false,
+      deadline: emergencyDeadline,
+      yieldIfNeeded,
+    });
+    const clusterSafeOpen = countEnemyOpeningsForPlacements(clusterSafeFill, enemyCandidates);
+    if (clusterSafeOpen < baselineOpen) {
+      activePlacements = clusterSafeFill;
+      baselineOpen = clusterSafeOpen;
+    }
+  }
+
+  if (baselineOpen > 0) {
+    activePlacements = await forceFillRemainingEnemyGaps(activePlacements, enemyCandidates, gapFillCandidates, {
+      maxClusterSize: 3,
+      allowOversizedClusters: true,
+      deadline: Math.max(deadline, Date.now() + 6000),
+      yieldIfNeeded,
+    });
+  }
+
   return activePlacements;
+}
+
+async function forceFillRemainingEnemyGaps(
+  plan,
+  enemyCandidates,
+  defenseCandidates,
+  {
+    maxClusterSize = 3,
+    allowOversizedClusters = false,
+    deadline = Number.POSITIVE_INFINITY,
+    yieldIfNeeded = async () => {},
+  } = {},
+) {
+  let filled = [...plan];
+
+  for (let added = 0; added < 80 && countEnemyOpeningsForPlacements(filled, enemyCandidates) > 0 && Date.now() < deadline; added += 1) {
+    await yieldIfNeeded();
+    const visibleEnemyPack = enemyPlacementPackForPlacements(filled, enemyCandidates);
+    const occupied = new Set(filled.flatMap((placement) => placement.cellKeys));
+    let best = null;
+
+    for (const enemy of visibleEnemyPack) {
+      if (enemy.cellKeys.some((key) => occupied.has(key))) continue;
+
+      let proposal = [...filled, { ...enemy, flexAdjusted: true, gapFill: true, emergencyGapFill: true }];
+      let contact = contactClusterStats(proposal, maxClusterSize);
+
+      if (contact.excess && !allowOversizedClusters) {
+        proposal = await reduceContactClustersBySliding(proposal, enemyCandidates, defenseCandidates, {
+          maxClusterSize,
+          maxMoveDistance: 4,
+          deadline,
+          yieldIfNeeded,
+        });
+        contact = contactClusterStats(proposal, maxClusterSize);
+        if (contact.excess) continue;
+      }
+
+      const open = countEnemyOpeningsForPlacements(proposal, enemyCandidates);
+      const score = open * 10000000 + contact.excess * 5000000 + contactEdgeCount(proposal) * 100000 + planLayoutPenalty(proposal);
+      if (!best || score < best.score) best = { proposal, score };
+    }
+
+    if (!best) break;
+    filled = best.proposal;
+  }
+
+  return filled;
 }
 
 async function addGapFillPlacements(
@@ -2101,6 +2173,7 @@ async function findDirectEnemyBlockerPlacement(
   { maxClusterSize, deadline, yieldIfNeeded },
 ) {
   const occupied = new Set(filled.flatMap((placement) => placement.cellKeys));
+  let best = null;
 
   for (const enemy of visibleEnemyPack) {
     if (Date.now() >= deadline) break;
@@ -2119,10 +2192,16 @@ async function findDirectEnemyBlockerPlacement(
       if (contact.excess) continue;
     }
 
-    return proposal;
+    const nextOpen = countEnemyOpeningsForPlacements(proposal, enemyCandidates);
+    const score =
+      nextOpen * 10000000 +
+      contactEdgeCount(proposal) * 100000 +
+      planLayoutPenalty(proposal) -
+      enemy.cellKeys.length * 25000;
+    if (!best || score < best.score) best = { proposal, score };
   }
 
-  return null;
+  return best?.proposal || null;
 }
 
 async function reduceContactClustersBySliding(
@@ -4184,7 +4263,7 @@ if (optimizeFurtherButton) optimizeFurtherButton.addEventListener("click", async
     clearInterval(countdownTimer);
     optimizeFurtherButton.disabled = false;
     if (fillGapsButton) fillGapsButton.disabled = false;
-    setOptimizeButtonText("Optimize Further");
+    setOptimizeButtonText("Optimize");
   }
 });
 
